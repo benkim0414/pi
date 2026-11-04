@@ -28,7 +28,8 @@
 	},
 	"pi": {
 		"extensions": [
-			"./packages/output-styles/src/index.ts"
+			"./packages/output-styles/src/index.ts",
+			"./packages/footer/src/index.ts"
 		]
 	}
 }
