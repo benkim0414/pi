@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    commit-message:
+      prefix: build
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      pi:
+        patterns: ["@earendil-works/*"]
+        update-types: [minor, patch]
+      dev-tool-patches:
+        patterns: [typescript, vitest]
+        update-types: [patch]
+  - package-ecosystem: github-actions
+    directory: /
+    commit-message:
+      prefix: ci
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5

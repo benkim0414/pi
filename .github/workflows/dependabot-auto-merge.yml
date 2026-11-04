@@ -1,0 +1,74 @@
+name: Dependabot auto-merge
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  enable:
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      vars.CI_AUTOMERGE_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3
+        id: metadata
+      - name: Check complete update eligibility and branch protection
+        id: eligible
+        env:
+          NAMES: ${{ steps.metadata.outputs.dependency-names }}
+          TYPE: ${{ steps.metadata.outputs.update-type }}
+          ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
+          MAINTAINERS: ${{ steps.metadata.outputs.maintainer-changes }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          node --input-type=module <<'JS'
+          import { execFileSync } from 'node:child_process';
+          import { appendFileSync } from 'node:fs';
+          const env = process.env;
+          const names = env.NAMES.split(',').map(s => s.trim());
+          const { eligibleUpdate } = await import('./scripts/updates.mjs');
+          const repository = JSON.parse(execFileSync('gh', ['api', `repos/${env.REPO}`], { encoding: 'utf8' }));
+          if (!repository.allow_auto_merge || !repository.allow_merge_commit) throw new Error('Enable auto-merge and merge commits first');
+          const rules = JSON.parse(execFileSync('gh', ['api', `repos/${env.REPO}/rules/branches/${encodeURIComponent(env.BASE)}`], { encoding: 'utf8' }));
+          const required = ['Quality (ubuntu-24.04)', 'Quality (macos-15)', 'Dependency review', 'CodeQL (JavaScript/TypeScript)'];
+          const protectedBranch = rules.some(rule => {
+            if (rule.type !== 'required_status_checks' || rule.parameters?.strict_required_status_checks_policy !== true) return false;
+            const contexts = new Set(rule.parameters.required_status_checks.map(check => check.context));
+            return required.every(context => contexts.has(context));
+          });
+          if (!protectedBranch) throw new Error('Require an active strict ruleset with all four required checks');
+          console.log('Verified auto-merge capability and all four strict required checks');
+          if (env.MAINTAINERS !== 'false' || !eligibleUpdate(names, env.TYPE, env.ECOSYSTEM)) {
+            console.log(`No auto-merge request: update is outside the patch allowlist (${env.ECOSYSTEM}, ${env.TYPE}, ${names.join(', ')}, maintainer changes: ${env.MAINTAINERS})`);
+            process.exit(0);
+          }
+          const changed = JSON.parse(execFileSync('gh', ['pr', 'view', env.PR, '--repo', env.REPO, '--json', 'files,changedFiles'], { encoding: 'utf8' }));
+          const files = changed.files;
+          if (files.length !== changed.changedFiles) throw new Error('Incomplete PR file list');
+          if (!files.length || !files.every(f => /^(package\.json|package-lock\.json|packages\/(footer|goal|output-styles|plan)\/package\.json)$/.test(f.path))) throw new Error('Unexpected files in dependency PR');
+          console.log('Verified patch eligibility and complete allowed file list');
+          appendFileSync(env.GITHUB_OUTPUT, 'allowed=true\n');
+          JS
+      - name: Request auto-merge after required checks
+        if: steps.eligible.outputs.allowed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: gh pr merge --auto --merge --match-head-commit "$HEAD" "$PR_URL"
