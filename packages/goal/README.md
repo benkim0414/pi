@@ -44,7 +44,10 @@ The auxiliary judge uses the current model by default. Configure `goal.json` in
 Pi's agent directory or trusted project `.pi` directory (project overrides):
 
 ```json
-{ "maxTurns": 20, "judge": { "provider": "provider-name", "model": "model-id" } }
+{
+	"maxTurns": 20,
+	"judge": { "provider": "provider-name", "model": "model-id" }
+}
 ```
 
 Judge calls use a 30-second timeout and 4096 output tokens. Temporary failures
