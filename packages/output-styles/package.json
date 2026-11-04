@@ -1,0 +1,26 @@
+{
+	"name": "output-styles",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "pi -e .",
+		"lint": "biome lint --error-on-warnings src test && node ../../scripts/test-conventions.mjs test",
+		"format": "biome format --write .",
+		"format:check": "biome format .",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run",
+		"check": "npm run lint && npm run format:check && npm run typecheck && npm test"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "1.5.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	}
+}

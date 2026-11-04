@@ -25,5 +25,10 @@
 	"engines": {
 		"node": ">=22.19.0",
 		"npm": ">=11"
+	},
+	"pi": {
+		"extensions": [
+			"./packages/output-styles/src/index.ts"
+		]
 	}
 }
