@@ -162,7 +162,7 @@ npm run check
 
 Tests use mocked Pi boundaries and temporary files without calling a provider.
 Manual Pi validation is required for loading, switching, persistence, reload,
-and useful model-behavior differences. ./../intent/output-styles/plan.md).
+and useful model-behavior differences.
 
 ## Code structure
 
