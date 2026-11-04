@@ -8,7 +8,7 @@
 		"format": "biome format --write .",
 		"format:check": "biome format .",
 		"typecheck": "node scripts/workspaces.mjs typecheck",
-		"test": "node --test scripts/test-conventions.test.mjs && node scripts/workspaces.mjs test",
+		"test": "node --test scripts/test-conventions.test.mjs scripts/updates.test.mjs && node scripts/workspaces.mjs test",
 		"check": "npm run lint && npm run format:check && npm run typecheck && npm test",
 		"prepare": "husky"
 	},
