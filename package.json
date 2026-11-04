@@ -29,7 +29,8 @@
 	"pi": {
 		"extensions": [
 			"./packages/output-styles/src/index.ts",
-			"./packages/footer/src/index.ts"
+			"./packages/footer/src/index.ts",
+			"./packages/plan/src/index.ts"
 		]
 	}
 }
