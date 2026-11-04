@@ -9,14 +9,16 @@
 		"format:check": "biome format .",
 		"typecheck": "node scripts/workspaces.mjs typecheck",
 		"test": "node --test scripts/test-conventions.test.mjs && node scripts/workspaces.mjs test",
-		"check": "npm run lint && npm run format:check && npm run typecheck && npm test"
+		"check": "npm run lint && npm run format:check && npm run typecheck && npm test",
+		"prepare": "husky"
 	},
 	"devDependencies": {
 		"@earendil-works/pi-coding-agent": "1.5.0",
 		"typescript": "7.0.2",
 		"vitest": "5.0.5",
 		"yaml": "2.9.1",
-		"@biomejs/biome": "2.3.5"
+		"@biomejs/biome": "2.3.5",
+		"husky": "9.1.7"
 	},
 	"packageManager": "npm@11.19.1",
 	"workspaces": [
