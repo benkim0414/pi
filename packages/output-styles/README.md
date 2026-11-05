@@ -81,6 +81,7 @@ For example, save `diagrams.md`:
 
 ```md
 ---
+
 name: Diagrams first
 description: Explain structure with a small diagram
 ---
@@ -123,7 +124,7 @@ The package uses its own JSON files, leaving Pi's settings unchanged:
 
 ```json
 {
-  "outputStyle": "Explanatory"
+	"outputStyle": "Explanatory"
 }
 ```
 
