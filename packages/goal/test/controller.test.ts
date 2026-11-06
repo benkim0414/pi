@@ -144,6 +144,58 @@ describe("goal transition ownership", () => {
 		expect(api.sendUserMessage).not.toHaveBeenCalled();
 	});
 
+	it("does not repeat a submission failure transition when persistence throws", async () => {
+		const { controller, api, run } = fixture();
+		api.sendUserMessage.mockRejectedValueOnce(new Error("send failed"));
+		api.appendEntry
+			.mockImplementationOnce(() => {})
+			.mockImplementationOnce(() => {
+				throw new Error("disk full");
+			});
+
+		await expect(run("fix parser")).rejects.toThrow("disk full");
+
+		expect(controller.snapshot()).toMatchObject({
+			status: "paused",
+			reason: "Submission failed: Error: send failed",
+			revision: 2,
+		});
+		expect(api.appendEntry).toHaveBeenCalledTimes(2);
+	});
+
+	it("reports a wake persistence failure without repeating the pause", async () => {
+		vi.useFakeTimers();
+		const { controller, context, api, run } = fixture();
+		try {
+			await run("fix parser");
+			await run("pause");
+			context.isIdle = () => false;
+			await run("resume");
+			controller.settled(false, context);
+			context.isIdle = () => true;
+			api.sendUserMessage.mockRejectedValueOnce(new Error("send failed"));
+			api.appendEntry.mockClear();
+			api.appendEntry.mockImplementationOnce(() => {
+				throw new Error("disk full");
+			});
+
+			await vi.advanceTimersByTimeAsync(1000);
+
+			expect(controller.snapshot()).toMatchObject({
+				status: "paused",
+				reason: "Submission failed: Error: send failed",
+			});
+			expect(api.appendEntry).toHaveBeenCalledOnce();
+			expect(context.ui.notify).toHaveBeenLastCalledWith(
+				"Cannot resume: Error: disk full",
+				"info",
+			);
+		} finally {
+			await controller.dispose();
+			vi.useRealTimers();
+		}
+	});
+
 	it("cancels a waiting goal without submitting after the deadline", async () => {
 		vi.useFakeTimers();
 		const { controller, context, event, api, run } = fixture();

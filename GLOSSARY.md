@@ -7,4 +7,4 @@ domain language.
 
 **Goal**:
 A standing objective with completion requirements and a turn budget that can span
-multiple agent runs. It can be active, paused, completed, or cleared.
+multiple agent runs. It can be active, paused, done, or cleared.

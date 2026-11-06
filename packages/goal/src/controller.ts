@@ -103,10 +103,8 @@ export class GoalController {
 		if (!this.eligible(c)) return;
 		this.unsubscribeInput = c.ui.onTerminalInput((data) => {
 			if (this.goal?.status === "active" && matchesKey(data, "escape")) {
-				this.invalidate();
-				pause(this.goal, "Execution aborted; use /goal resume.");
-				this.save();
-				this.notify(this.goal.reason);
+				const reason = this.abortActiveGoal();
+				if (reason !== undefined) this.notify(reason);
 			}
 			return undefined;
 		});
@@ -146,11 +144,7 @@ export class GoalController {
 
 	settled(aborted: boolean, c: ExtensionContext): void {
 		this.context = c;
-		if (aborted && this.goal?.status === "active") {
-			this.invalidate();
-			pause(this.goal, "Execution aborted; use /goal resume.");
-			this.save();
-		}
+		if (aborted) this.abortActiveGoal();
 		if (this.goal?.wait || this.wakePending) this.scheduleWake();
 	}
 
@@ -224,6 +218,15 @@ export class GoalController {
 			default:
 				throw new Error("Unknown process action");
 		}
+	}
+
+	private abortActiveGoal(): string | undefined {
+		const goal = this.goal;
+		if (!goal || goal.status !== "active") return;
+		this.invalidate();
+		pause(goal, "Execution aborted; use /goal resume.");
+		this.save();
+		return goal.reason;
 	}
 
 	private eligible(context: ExtensionContext): boolean {
@@ -364,8 +367,7 @@ export class GoalController {
 				try {
 					await this.submit(this.goal);
 				} catch (error) {
-					pause(this.goal, `Cannot resume: ${String(error)}`);
-					this.save();
+					this.notify(`Cannot resume: ${String(error)}`);
 				}
 			},
 			Math.min(
@@ -434,12 +436,7 @@ export class GoalController {
 		this.notify(
 			`Goal set (${this.goal.limit} turns): ${this.goal.objective}\n${JSON.stringify(this.goal.contract)}`,
 		);
-		try {
-			await this.submit(this.goal);
-		} catch (error) {
-			pause(this.goal, `Submission failed: ${String(error)}`);
-			this.save();
-		}
+		await this.submit(this.goal);
 	}
 
 	private showGoal(action: CommandAction): void {
