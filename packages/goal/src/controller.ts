@@ -222,7 +222,7 @@ export class GoalController {
 
 	private abortActiveGoal(): string | undefined {
 		const goal = this.goal;
-		if (!goal || goal.status !== "active") return;
+		if (goal?.status !== "active") return;
 		this.invalidate();
 		pause(goal, "Execution aborted; use /goal resume.");
 		this.save();
