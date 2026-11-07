@@ -1,0 +1,3 @@
+# Local scratch only; evidence defaults to /tmp/pi-verify-evidence/
+artifacts/
+*.log
