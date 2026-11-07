@@ -3,7 +3,7 @@
 \* Code under check (sync against these functions):
 \*   packages/goal/src/controller.ts
 \*     evaluate, evaluationCheckpoint, invalidate, onHumanInput,
-\*     controlGoal (pause/clear/resume), assignWait, commitVerdict
+\*     controlGoal (pause/clear/resume), resolveWait, commitVerdict
 \*   packages/goal/src/domain.ts
 \*     applyVerdict, pause, resume, newGoal
 \*
@@ -233,7 +233,7 @@ JudgeContinue ==
           /\ continued' = TRUE
   /\ UNCHANGED <<used, limit, epoch, human, pEpoch, pRevision, pHuman>>
 
-\* assignWait succeeds (live process/pid or timed wait)
+\* resolveWait succeeds (live process/pid or timed wait)
 JudgeWaitHeld ==
   /\ IsCurrent
   /\ FinishReply
@@ -249,22 +249,16 @@ JudgeWaitHeld ==
           /\ UNCHANGED <<status, revision>>
   /\ UNCHANGED <<used, limit, epoch, human, pEpoch, pRevision, pHuman>>
 
-\* assignWait fails (dead pid / unknown session / no seconds):
-\* commitVerdict then falls through to continue:true while still active.
-\* Mirrors controller.ts commitVerdict + assignWait exactly.
+\* No supplied target or cooldown is usable: commitVerdict pauses.
 JudgeWaitMiss ==
   /\ IsCurrent
   /\ FinishReply
   /\ lastCommit' = "wait_miss"
-  /\ IF used >= limit
-     THEN /\ revision < MaxTicket
-          /\ status' = "paused"
-          /\ revision' = revision + 1
-          /\ waiting' = FALSE
-          /\ continued' = FALSE
-     ELSE /\ waiting' = FALSE
-          /\ continued' = TRUE
-          /\ UNCHANGED <<status, revision>>
+  /\ revision < MaxTicket
+  /\ status' = "paused"
+  /\ revision' = revision + 1
+  /\ waiting' = FALSE
+  /\ continued' = FALSE
   /\ UNCHANGED <<used, limit, epoch, human, pEpoch, pRevision, pHuman>>
 
 BarrierLifts ==

@@ -656,7 +656,7 @@ export class GoalController {
 		return result;
 	}
 
-	private assignWait(goal: Goal, result: Verdict): void {
+	private resolveWait(result: Verdict): Goal["wait"] {
 		const deadline = Date.now() + 1800000;
 		if (
 			result.wait_on_session &&
@@ -666,21 +666,31 @@ export class GoalController {
 					(p) => p.id === result.wait_on_session && p.running && !p.triggered,
 				)
 		)
-			goal.wait = {
+			return {
 				kind: "process",
 				id: result.wait_on_session,
 				deadline,
 				reason: result.reason,
 			};
-		else if (result.wait_on_pid && pidAlive(result.wait_on_pid))
-			goal.wait = {
+		if (
+			result.wait_on_pid &&
+			Number.isSafeInteger(result.wait_on_pid) &&
+			result.wait_on_pid > 0 &&
+			pidAlive(result.wait_on_pid)
+		)
+			return {
 				kind: "pid",
 				pid: result.wait_on_pid,
 				deadline,
 				reason: result.reason,
 			};
-		else if (result.wait_for_seconds)
-			goal.wait = {
+		if (
+			result.wait_for_seconds &&
+			Number.isSafeInteger(result.wait_for_seconds) &&
+			result.wait_for_seconds > 0 &&
+			result.wait_for_seconds <= 2147483
+		)
+			return {
 				kind: "time",
 				deadline: Date.now() + result.wait_for_seconds * 1000,
 				reason: result.reason,
@@ -710,8 +720,14 @@ export class GoalController {
 		event: AgentBeforeSettleEvent,
 	): BoundaryResult | undefined {
 		applyVerdict(goal, result);
-		if (result.verdict === "wait" && goal.status === "active")
-			this.assignWait(goal, result);
+		if (result.verdict === "wait" && goal.status === "active") {
+			goal.wait = this.resolveWait(result);
+			if (!goal.wait)
+				pause(
+					goal,
+					`Cannot wait: no live target or cooldown is available. ${result.reason} Use /goal resume to continue.`,
+				);
+		}
 		this.save();
 		this.notify(`Goal ${goal.status}: ${goal.reason}`);
 		if (goal.wait) {

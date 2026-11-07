@@ -3,7 +3,7 @@
  * Not a product test — lives with the formal skill. Do not move into packages/goal/test.
  *
  * Asserts the product promise (wait must not silently continue). This test fails
- * on the known defect and passes once assignWait/commitVerdict are fixed.
+ * on the original defect and passes when commitVerdict refuses an unavailable wait.
  */
 import type {
 	AgentBeforeSettleEvent,
@@ -48,7 +48,7 @@ describe("NoSilentWaitContinue (formal finding)", () => {
 
 		const result = await controller.evaluate(event, context);
 
-		expect(controller.snapshot()?.status).toBe("active");
+		expect(controller.snapshot()?.status).toBe("paused");
 		// Product promise: wait parks or refuses; it must not request continuation.
 		expect(result?.continue).not.toBe(true);
 	});
