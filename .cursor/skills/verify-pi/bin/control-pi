@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# Drive an isolated Pi TUI session for verify-pi. One logical instance per RUN_ID.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
+PI_BIN="${PI_BIN:-$ROOT/node_modules/.bin/pi}"
+TMUX_BIN=(tmux)
+if [[ -f /exec-daemon/tmux.portal.conf ]]; then
+	TMUX_BIN=(tmux -f /exec-daemon/tmux.portal.conf)
+fi
+
+SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+RUNS_ROOT="${PI_VERIFY_RUNS_ROOT:-/tmp/pi-verify-runs}"
+# Keep evidence outside the repo so format/lint trees stay clean.
+ARTIFACTS_ROOT="${PI_VERIFY_ARTIFACTS_ROOT:-/tmp/pi-verify-evidence}"
+
+EXTENSIONS=(
+	"$ROOT/packages/footer/src/index.ts"
+	"$ROOT/packages/output-styles/src/index.ts"
+	"$ROOT/packages/plan/src/index.ts"
+	"$ROOT/packages/goal/src/index.ts"
+)
+
+usage() {
+	cat <<'EOF'
+Usage: control-pi <command> [args]
+
+  launch [--workdir DIR] [--cwd DIR]
+      Start an isolated Pi TUI with workspace extensions. Prints RUN_ID.
+  doctor [RUN_ID]
+      Read-only health check for the instance.
+  send [RUN_ID] -- <text...>
+      Type text and press Enter in the Pi session.
+  keys [RUN_ID] -- <tmux-send-keys args...>
+      Forward raw tmux send-keys (e.g. Escape, Up, Enter).
+  capture [RUN_ID] [--path FILE]
+      Capture the pane. Default path: artifacts/<RUN_ID>/pane.txt
+  snapshot [RUN_ID] --name NAME
+      Capture pane to artifacts/<RUN_ID>/<NAME>.txt
+  cleanup [RUN_ID]
+      Stop the tmux session and remove run scratch dirs. Keeps artifacts.
+  env [RUN_ID]
+      Print run state (session, workdir, evidence dir).
+
+Environment:
+  PI_VERIFY_RUN_ID   active run when RUN_ID omitted
+  PI_BIN             pi binary (default: workspace node_modules/.bin/pi)
+EOF
+}
+
+die() { echo "control-pi: $*" >&2; exit 1; }
+
+require_pi() {
+	[[ -x "$PI_BIN" ]] || die "pi not found at $PI_BIN; run npm ci from $ROOT"
+}
+
+run_dir() {
+	local id="$1"
+	echo "$RUNS_ROOT/$id"
+}
+
+load_run() {
+	local id="${1:-${PI_VERIFY_RUN_ID:-}}"
+	[[ -n "$id" ]] || die "RUN_ID required (pass it or set PI_VERIFY_RUN_ID)"
+	local dir
+	dir="$(run_dir "$id")"
+	[[ -f "$dir/state.env" ]] || die "unknown run $id (missing $dir/state.env)"
+	# shellcheck disable=SC1090
+	source "$dir/state.env"
+	RUN_ID="$id"
+	RUN_DIR="$dir"
+}
+
+cmd_launch() {
+	require_pi
+	local workdir="" cwd_override=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--workdir) workdir="$2"; shift 2 ;;
+			--cwd) cwd_override="$2"; shift 2 ;;
+			*) die "unknown launch arg: $1" ;;
+		esac
+	done
+
+	local id
+	id="r$(date +%Y%m%d%H%M%S)-$$"
+	local dir session_dir evidence
+	dir="$(run_dir "$id")"
+	session_dir="$dir/session"
+	evidence="$ARTIFACTS_ROOT/$id"
+	mkdir -p "$dir" "$session_dir" "$evidence"
+
+	if [[ -z "$workdir" ]]; then
+		workdir="$dir/workdir"
+		mkdir -p "$workdir"
+	else
+		mkdir -p "$workdir"
+	fi
+	local cwd="${cwd_override:-$workdir}"
+
+	local session="pi-verify-$id"
+	local ext_args=()
+	local ext
+	for ext in "${EXTENSIONS[@]}"; do
+		[[ -f "$ext" ]] || die "missing extension $ext"
+		ext_args+=(-e "$ext")
+	done
+
+	"${TMUX_BIN[@]}" has-session -t "=$session" 2>/dev/null && \
+		die "tmux session $session already exists"
+
+	"${TMUX_BIN[@]}" new-session -d -s "$session" -x 120 -y 40 -c "$cwd" -- \
+		env PI_CODING_AGENT_SESSION_DIR="$session_dir" PI_OFFLINE=1 \
+		"$PI_BIN" --session-dir "$session_dir" --no-tools "${ext_args[@]}"
+
+	cat >"$dir/state.env" <<EOF
+TMUX_SESSION=$session
+WORKDIR=$workdir
+CWD=$cwd
+SESSION_DIR=$session_dir
+EVIDENCE_DIR=$evidence
+PI_BIN=$PI_BIN
+ROOT=$ROOT
+STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+
+	# Wait until footer or extension list appears
+	local i pane=""
+	for i in $(seq 1 40); do
+		pane="$("${TMUX_BIN[@]}" capture-pane -t "$session" -p -S -80 2>/dev/null || true)"
+		if [[ "$pane" == *"[Extensions]"* ]] || [[ "$pane" == *"style:"* ]]; then
+			break
+		fi
+		sleep 0.25
+	done
+	[[ "$pane" == *"[Extensions]"* || "$pane" == *"style:"* ]] || \
+		die "Pi did not become ready; last pane:\n$pane"
+
+	printf '%s\n' "$id"
+}
+
+cmd_doctor() {
+	load_run "${1:-}"
+	local pane ok=0
+	pane="$("${TMUX_BIN[@]}" capture-pane -t "$TMUX_SESSION" -p -S -120)"
+	echo "run_id=$RUN_ID"
+	echo "tmux_session=$TMUX_SESSION"
+	echo "cwd=$CWD"
+	echo "session_dir=$SESSION_DIR"
+	echo "evidence_dir=$EVIDENCE_DIR"
+	echo "pi_bin=$PI_BIN"
+
+	if ! "${TMUX_BIN[@]}" has-session -t "=$TMUX_SESSION" 2>/dev/null; then
+		echo "doctor: FAIL tmux session missing"
+		exit 1
+	fi
+	if [[ "$pane" != *"footer/src"* || "$pane" != *"goal/src"* || \
+		"$pane" != *"output-styles/src"* || "$pane" != *"plan/src"* ]]; then
+		# Extensions only print at startup; require style footer as ongoing signal
+		if [[ "$pane" != *"style:"* ]]; then
+			echo "doctor: FAIL extensions/footer not visible"
+			echo "$pane" | tail -20
+			exit 1
+		fi
+	fi
+	if [[ "$pane" != *"style:"* ]]; then
+		echo "doctor: FAIL output-styles footer missing"
+		exit 1
+	fi
+	echo "doctor: OK"
+}
+
+cmd_send() {
+	local id=""
+	if [[ "${1:-}" != "--" && -n "${1:-}" ]]; then
+		id="$1"; shift
+	fi
+	[[ "${1:-}" == "--" ]] || die "usage: control-pi send [RUN_ID] -- <text>"
+	shift
+	load_run "$id"
+	local text="$*"
+	# Do not use send-keys -l: Pi slash commands fail to bind when keys are
+	# forced literal. Quote the string as a single tmux argument instead.
+	"${TMUX_BIN[@]}" send-keys -t "$TMUX_SESSION" "$text" Enter
+}
+
+cmd_keys() {
+	local id=""
+	if [[ "${1:-}" != "--" && -n "${1:-}" ]]; then
+		id="$1"; shift
+	fi
+	[[ "${1:-}" == "--" ]] || die "usage: control-pi keys [RUN_ID] -- <tmux send-keys args>"
+	shift
+	load_run "$id"
+	"${TMUX_BIN[@]}" send-keys -t "$TMUX_SESSION" "$@"
+}
+
+cmd_capture() {
+	local id="" path=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--path) path="$2"; shift 2 ;;
+			*)
+				if [[ -z "$id" && "$1" != --* ]]; then id="$1"; shift
+				else die "usage: control-pi capture [RUN_ID] [--path FILE]"; fi
+				;;
+		esac
+	done
+	load_run "$id"
+	path="${path:-$EVIDENCE_DIR/pane.txt}"
+	mkdir -p "$(dirname "$path")"
+	"${TMUX_BIN[@]}" capture-pane -t "$TMUX_SESSION" -p -S -200 >"$path"
+	echo "$path"
+}
+
+cmd_snapshot() {
+	local id="" name=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--name) name="$2"; shift 2 ;;
+			*)
+				if [[ -z "$id" && "$1" != --* ]]; then id="$1"; shift
+				else die "usage: control-pi snapshot [RUN_ID] --name NAME"; fi
+				;;
+		esac
+	done
+	[[ -n "$name" ]] || die "snapshot requires --name"
+	load_run "$id"
+	local path="$EVIDENCE_DIR/${name}.txt"
+	mkdir -p "$EVIDENCE_DIR"
+	"${TMUX_BIN[@]}" capture-pane -t "$TMUX_SESSION" -p -S -200 >"$path"
+	echo "$path"
+}
+
+cmd_cleanup() {
+	load_run "${1:-}"
+	if "${TMUX_BIN[@]}" has-session -t "=$TMUX_SESSION" 2>/dev/null; then
+		"${TMUX_BIN[@]}" kill-session -t "$TMUX_SESSION"
+	fi
+	# Remove scratch only; keep EVIDENCE_DIR
+	rm -rf "$RUN_DIR"
+	echo "cleaned run $RUN_ID (evidence retained at $EVIDENCE_DIR)"
+}
+
+cmd_env() {
+	load_run "${1:-}"
+	cat "$RUN_DIR/state.env"
+}
+
+main() {
+	local cmd="${1:-}"
+	[[ -n "$cmd" ]] || { usage; exit 2; }
+	shift || true
+	case "$cmd" in
+		launch) cmd_launch "$@" ;;
+		doctor) cmd_doctor "$@" ;;
+		send) cmd_send "$@" ;;
+		keys) cmd_keys "$@" ;;
+		capture) cmd_capture "$@" ;;
+		snapshot) cmd_snapshot "$@" ;;
+		cleanup) cmd_cleanup "$@" ;;
+		env) cmd_env "$@" ;;
+		-h|--help|help) usage ;;
+		*) die "unknown command: $cmd" ;;
+	esac
+}
+
+main "$@"
