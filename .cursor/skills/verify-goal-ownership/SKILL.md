@@ -1,7 +1,7 @@
 ---
 
 name: verify-goal-ownership
-description: "Formally check GoalController ownership and wait-commit promises with TLA+/TLC. Use when changing packages/goal evaluate, invalidate, commitVerdict, assignWait, pause/clear/resume, or turn budget — or when a goal keeps running after pause/clear/wait."
+description: "Formally check GoalController ownership and wait-commit promises with TLA+/TLC. Use when changing packages/goal evaluate, invalidate, commitVerdict, resolveWait, pause/clear/resume, or turn budget — or when a goal keeps running after pause/clear/wait."
 ---
 
 # Verify goal ownership
@@ -12,7 +12,7 @@ A standing goal must not keep driving the agent after the user pauses, clears, o
 
 Run this skill when a change touches any of:
 
-- `packages/goal/src/controller.ts` — `evaluate`, `evaluationCheckpoint`, `invalidate`, `onHumanInput`, `controlGoal`, `assignWait`, `commitVerdict`
+- `packages/goal/src/controller.ts` — `evaluate`, `evaluationCheckpoint`, `invalidate`, `onHumanInput`, `controlGoal`, `resolveWait`, `commitVerdict`
 - `packages/goal/src/domain.ts` — `applyVerdict`, `pause`, `resume`, `newGoal`
 
 If the change is intentional (new promise), update the model and this skill, then move the sync commit only after TLC matches the new code.
@@ -35,10 +35,10 @@ Bounds: `MaxTurns = 2`, ticket counters capped at `MaxTicket = 4` inside the spe
 ## Coverage record
 
 - **Model:** `.cursor/skills/verify-goal-ownership/model/GoalOwnership.tla`
-- **Configs:** `GoalOwnership.cfg` (all invariants), `GoalOwnershipOwnershipOnly.cfg` (excludes the known wait-miss finding so ownership can be rechecked green)
+- **Configs:** `GoalOwnership.cfg` (all invariants), `GoalOwnershipOwnershipOnly.cfg` (checks ownership separately from wait admission)
 - **View:** `model/view.mjs` (reader labels for `/statechart`)
 - **Code:** functions listed above in `controller.ts` / `domain.ts`
-- **Sync commit:** `eecb711b8e0710521e05bebf970416f71e58f44f` — replace on each confirmed sync (see footer)
+- **Sync commit:** `79a09a4a98401bc1612e4248c78ad6609b333d2c` — controller and model verified together; all five invariants pass across 2,117 states.
 - **Out of scope:** gates, drafting, process ownership, timer wakes, persistence, overlapping evaluates that overwrite `pending` without aborting the first
 
 ## How to run
@@ -53,7 +53,7 @@ test -f ~/.local/share/tla/tla2tools.jar || curl -fsSL -o ~/.local/share/tla/tla
 export TLA2TOOLS=~/.local/share/tla/tla2tools.jar
 export JAVA="$(command -v java)"
 
-# 2) Full check (expect NoSilentWaitContinue to fail on current code — known finding)
+# 2) Full check (all invariants must pass)
 .cursor/skills/verify-goal-ownership/run.sh all /tmp/goal-ownership-out
 
 # 3) Ownership-only check (must pass: NoStaleContinue, BudgetOk, ClearedQuiet, TypeOK)
@@ -64,20 +64,22 @@ Always read TLC results with pstack **`/statechart`**. It turns each broken inva
 
 Exit codes from `run.sh`: `0` all checked invariants hold; `1` an invariant breaks; `2` tool/setup failure.
 
-## Known finding (current code)
+## Regression: unavailable wait target
 
-`NoSilentWaitContinue` **fails** on the code at the sync commit.
+The original defect let a judge wait with no usable target fall through to
+`continue: true`. The controller now tries process session, PID, then cooldown;
+if none is usable, it pauses with a reason and requires `/goal resume`.
+Budget exhaustion still takes precedence.
 
-- **Path:** set goal → turn settles / judge starts → judge says wait with a missing barrier → goal stays active and continues.
-- **Code:** `assignWait` leaves `goal.wait` unset when the pid is dead or the session is unknown and there is no `wait_for_seconds`; `commitVerdict` then returns `continue: true`.
-- **Harm:** burns the turn budget in a loop.
-- **Replay against the real controller** asserts the promise (`continue` is not requested). It **fails** on the defect and **passes** once the controller is fixed:
+`JudgeWaitMiss` models that pause. Both configs must pass. The standalone replay
+asserts a paused goal and no continuation; normal controller tests also cover
+unavailable targets, fallback order, resume, cooldown release, and budget precedence.
 
 ```bash
 cd .cursor/skills/verify-goal-ownership && npx vitest run --config vitest.config.ts
 ```
 
-Do **not** weaken `NoSilentWaitContinue` to make TLC green. Do **not** change product code unless the user asks. Ownership-only config exists so agents can still prove pause/clear/human ownership after an unrelated change.
+Do **not** weaken `NoSilentWaitContinue` to make TLC green. Change product behavior only when the user authorizes it. Keep the ownership-only config for focused ownership checks.
 
 ## Tell a modeling error from a real bug
 
@@ -99,4 +101,4 @@ Before trusting a green ownership-only run after you edit the model, replace `Ju
 
 ---
 
-**Sync commit:** `eecb711b8e0710521e05bebf970416f71e58f44f`
+**Sync commit:** `79a09a4a98401bc1612e4248c78ad6609b333d2c`
