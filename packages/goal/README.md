@@ -23,7 +23,9 @@ iterations do not count. `/goal resume` grants a fresh budget.
   five-minute timeout and three failed attempts before pausing. Resume resets
   attempts. Contract verification text is never executed automatically.
 - `/goal wait <pid> [reason]` and `/goal unwait`: park on a local PID or release
-  waiting. The judge can also request process-session or timed waits.
+  waiting. The judge can also request process-session or timed waits. If none of
+  the supplied targets or cooldowns is usable, the goal pauses with a reason;
+  `/goal resume` restarts it.
 
 Aliases: continue/unpause resume; stop/done clear; gate rm removes. Control words
 pause/resume/status/show/unwait accept trailing text with a diagnostic; use `--`

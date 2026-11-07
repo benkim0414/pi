@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { requestAuxiliary } from "../src/auxiliary.js";
 import { GoalController } from "../src/controller.js";
 import { parseCommand } from "../src/domain.js";
+import { Processes } from "../src/processes.js";
 
 vi.mock("../src/auxiliary.js", () => ({ requestAuxiliary: vi.fn() }));
 
@@ -194,6 +195,187 @@ describe("goal transition ownership", () => {
 			await controller.dispose();
 			vi.useRealTimers();
 		}
+	});
+
+	it.each([
+		{ wait_on_pid: 2147483647 },
+		{ wait_on_session: "missing" },
+		{ wait_on_session: "missing", wait_on_pid: -1 },
+		{ wait_on_pid: 2147483647, wait_for_seconds: -1 },
+		{ wait_on_pid: 2147483647, wait_for_seconds: 0.5 },
+		{ wait_on_pid: 2147483647, wait_for_seconds: 2147484 },
+	])("pauses when a judge wait has no usable target: %j", async (target) => {
+		vi.useFakeTimers();
+		const { controller, context, event, api, run } = fixture();
+		try {
+			await run("fix parser");
+			vi.mocked(requestAuxiliary).mockResolvedValueOnce(
+				JSON.stringify({
+					verdict: "wait",
+					reason: "awaiting evidence",
+					...target,
+				}),
+			);
+
+			const result = await controller.evaluate(event, context);
+			await vi.advanceTimersByTimeAsync(3000);
+
+			expect(result).toBeUndefined();
+			expect(controller.snapshot()).toMatchObject({
+				status: "paused",
+				wait: undefined,
+				used: 1,
+			});
+			expect(controller.snapshot()?.reason).toContain("Cannot wait:");
+			expect(controller.snapshot()?.reason).toContain("awaiting evidence");
+			expect(api.appendEntry.mock.calls.at(-1)![1]).toEqual(
+				controller.snapshot(),
+			);
+			expect(context.ui.notify).toHaveBeenLastCalledWith(
+				`Goal paused: ${controller.snapshot()?.reason}`,
+				"info",
+			);
+			expect(api.sendUserMessage).toHaveBeenCalledOnce();
+
+			await run("resume");
+
+			expect(controller.snapshot()).toMatchObject({
+				status: "active",
+				used: 0,
+			});
+			expect(api.sendUserMessage).toHaveBeenCalledTimes(2);
+		} finally {
+			await controller.dispose();
+			vi.useRealTimers();
+		}
+	});
+
+	it.each([
+		{
+			target: {
+				wait_on_session: "missing",
+				wait_on_pid: process.pid,
+				wait_for_seconds: 2,
+			},
+			kind: "pid",
+		},
+		{
+			target: {
+				wait_on_session: "missing",
+				wait_on_pid: 2147483647,
+				wait_for_seconds: 2,
+			},
+			kind: "time",
+		},
+	])(
+		"uses the available $kind fallback without continuing",
+		async ({ target, kind }) => {
+			vi.useFakeTimers();
+			const { controller, context, event, api, run } = fixture();
+			try {
+				await run("fix parser");
+				vi.mocked(requestAuxiliary).mockResolvedValueOnce(
+					JSON.stringify({
+						verdict: "wait",
+						reason: "awaiting evidence",
+						...target,
+					}),
+				);
+
+				const result = await controller.evaluate(event, context);
+
+				expect(result).toBeUndefined();
+				expect(controller.snapshot()).toMatchObject({
+					status: "active",
+					wait: { kind },
+					used: 1,
+				});
+				expect(api.sendUserMessage).toHaveBeenCalledOnce();
+				if (kind === "time") {
+					await vi.advanceTimersByTimeAsync(2000);
+					expect(controller.snapshot()?.wait).toBeUndefined();
+					expect(controller.snapshot()?.used).toBe(1);
+					expect(api.sendUserMessage).toHaveBeenCalledTimes(2);
+				}
+			} finally {
+				await controller.dispose();
+				vi.useRealTimers();
+			}
+		},
+	);
+
+	it.each([
+		{ running: true, triggered: false, status: "active" },
+		{ running: false, triggered: false, status: "paused" },
+		{ running: true, triggered: true, status: "paused" },
+	])(
+		"admits only a running, untriggered process session: %j",
+		async ({ running, triggered, status }) => {
+			vi.useFakeTimers();
+			const list = vi.spyOn(Processes.prototype, "list").mockReturnValue([
+				{
+					id: "owned",
+					pid: process.pid,
+					command: "build",
+					output: "",
+					patterns: [],
+					running,
+					triggered,
+				},
+			]);
+			const { controller, context, event, run } = fixture();
+			try {
+				await run("fix parser");
+				vi.mocked(requestAuxiliary).mockResolvedValueOnce(
+					JSON.stringify({
+						verdict: "wait",
+						reason: "build",
+						wait_on_session: "owned",
+						...(running && !triggered
+							? { wait_on_pid: process.pid, wait_for_seconds: 2 }
+							: {}),
+					}),
+				);
+
+				const result = await controller.evaluate(event, context);
+
+				expect(result).toBeUndefined();
+				expect(controller.snapshot()?.status).toBe(status);
+				expect(controller.snapshot()?.wait?.kind).toBe(
+					status === "active" ? "process" : undefined,
+				);
+			} finally {
+				await controller.dispose();
+				list.mockRestore();
+				vi.useRealTimers();
+			}
+		},
+	);
+
+	it("keeps budget exhaustion ahead of wait admission", async () => {
+		const { controller, context, event, run } = fixture();
+		await run("fix parser");
+		for (let turn = 1; turn <= 20; turn++) {
+			vi.mocked(requestAuxiliary).mockResolvedValueOnce(
+				JSON.stringify(
+					turn < 20
+						? { verdict: "continue", reason: "more work" }
+						: {
+								verdict: "wait",
+								reason: "missing",
+								wait_on_session: "missing",
+							},
+				),
+			);
+			await controller.evaluate(event, context);
+		}
+
+		expect(controller.snapshot()).toMatchObject({
+			status: "paused",
+			used: 20,
+			wait: undefined,
+			reason: "Turn budget exhausted. Use /goal resume or /goal clear.",
+		});
 	});
 
 	it("cancels a waiting goal without submitting after the deadline", async () => {
