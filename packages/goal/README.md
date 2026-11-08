@@ -70,4 +70,12 @@ responses and real local terminals without provider credentials.
 
 ## Code structure
 
-The entrypoint delegates Pi lifecycle registration to `src/session.ts`. `GoalController` owns session state, cancellation, generation checks, wake scheduling, persistence, and process-registry replacement. Commands, boundary evaluation, auxiliary model requests, and process-tool registration have dedicated modules. Domain parsing and transitions remain independent of Pi and I/O. The persisted goal remains a plain versioned object.
+The entrypoint delegates Pi registration to `src/session.ts`. Commands and session
+callbacks translate host input into complete `GoalController` actions. The
+controller privately owns goal state, evaluation, cancellation, generation checks,
+wake scheduling, persistence, and process-registry replacement. Async completion
+and cleanup retain ownership checks; only one current evaluation owns a turn.
+New human input releases that ownership while obsolete requests wind down. The
+process tool uses the current registry through a getter. Domain parsing and
+transitions remain independent of Pi and I/O. The persisted goal remains a plain
+versioned object. Lifecycle tests exercise registered commands and session events.
