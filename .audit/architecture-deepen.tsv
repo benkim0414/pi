@@ -8,3 +8,7 @@ ts	phase	decision	why	evidence	result
 2026-11-08T08:50:06Z	unit1	explicit EvaluationEffect + consumeTurn + applyDraftContract	Strong ICA candidate; Model the Domain; Minimize Reader Load	packages/goal/src/domain.ts packages/goal/src/controller.ts	goal check 110 then 121 tests; TLC 5 invariants
 2026-11-08T08:50:06Z	unit2	parseSubgoal parseGate parseWaitPid in domain	Worth exploring ICA candidate; one command language	packages/goal/src/domain.ts	121 goal tests green
 2026-11-08T08:50:06Z	unit3	waitHoldFacts shared builder on controller	Worth exploring ICA candidate; locality of processHeld	packages/goal/src/controller.ts waitHoldFacts	121 goal tests green; TLC green
+2026-11-08T08:51:11Z	ship	opened PR #15 with all four round-1 deepenings	Opening a PR playbook; autonomous run continues until ICA empty	https://github.com/benkim0414/pi/pull/15	open
+2026-11-08T08:51:11Z	explore	spawned ICA round 2 rescan after landings	exit predicate needs fresh Strong/Worth exploring count of zero	Task bc-cf974af2	waiting
+2026-11-08T08:58:14Z	explore	ICA round 2: ZERO Strong and ZERO Worth exploring; stop	exit predicate met after landings on 67d1ea9	/tmp/architecture-review-20261108085814.html; Task bc-cf974af2	predicate met
+2026-11-08T08:58:14Z	done	autonomous architecture deepen run complete	fresh ICA empty of Strong/Worth exploring	https://github.com/benkim0414/pi/pull/15	done
