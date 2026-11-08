@@ -1,0 +1,10 @@
+ts	phase	decision	why	evidence	result
+2026-11-08T08:32:41Z	start	begin architecture deepen autonomous run	user asked to run improve-codebase-architecture and implement until Strong/Worth-exploring candidates are gone	agent-run architecture-deepen-until-empty	open
+2026-11-08T08:32:41Z	frame	exit predicate: fresh ICA report has zero Strong and zero Worth-exploring candidates	autonomous-run needs a checkable done condition; Speculative leftovers do not block stop	improve-codebase-architecture SKILL.md step 2	open
+2026-11-08T08:32:41Z	frame	skip Cursor /loop wake; iterate in-session	no external event to watch; continuous agent turn is the wake	playbooks/autonomous-run.md step 2	skip
+2026-11-08T08:33:31Z	frame	scope: packages/goal hot spot plus footer output-styles plan; prior deepenings already landed domain field transitions	git hot spots and PR 6/11/14 history	git log packages/; gh pr 6 11 14	open
+2026-11-08T08:33:31Z	explore	spawned poteto-agent architecture friction scan; also local read of controller domain leftover used++	Guard the Context Window; residual from PR 14 left turn used in controller	Task bc-de035194; controller.ts:188	waiting
+2026-11-08T08:45:42Z	explore	ICA round 1 report written; 1 Strong + 3 Worth exploring; top is explicit threshold pause results	user autonomy grant skips pick-a-candidate question; implement until Strong/Worth exploring empty	/tmp/architecture-review-20261108084436.html	open
+2026-11-08T08:50:06Z	unit1	explicit EvaluationEffect + consumeTurn + applyDraftContract	Strong ICA candidate; Model the Domain; Minimize Reader Load	packages/goal/src/domain.ts packages/goal/src/controller.ts	goal check 110 then 121 tests; TLC 5 invariants
+2026-11-08T08:50:06Z	unit2	parseSubgoal parseGate parseWaitPid in domain	Worth exploring ICA candidate; one command language	packages/goal/src/domain.ts	121 goal tests green
+2026-11-08T08:50:06Z	unit3	waitHoldFacts shared builder on controller	Worth exploring ICA candidate; locality of processHeld	packages/goal/src/controller.ts waitHoldFacts	121 goal tests green; TLC green

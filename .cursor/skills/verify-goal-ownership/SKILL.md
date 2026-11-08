@@ -38,7 +38,7 @@ Bounds: `MaxTurns = 2`, ticket counters capped at `MaxTicket = 4` inside the spe
 - **Configs:** `GoalOwnership.cfg` (all invariants), `GoalOwnershipOwnershipOnly.cfg` (checks ownership separately from wait admission)
 - **View:** `model/view.mjs` (reader labels for `/statechart`)
 - **Code:** functions listed above in `controller.ts` / `domain.ts`
-- **Sync commit:** `79a09a4a98401bc1612e4248c78ad6609b333d2c` — controller and model verified together; all five invariants pass across 2,117 states.
+- **Sync commit:** `67d1ea9d1f607125bbea6a22e42447c0d2cd4abd` — controller and model verified together; all five invariants pass across 2,117 states.
 - **Out of scope:** gates, drafting, process ownership, timer wakes, persistence, overlapping evaluates that overwrite `pending` without aborting the first
 
 ## How to run
@@ -101,4 +101,4 @@ Before trusting a green ownership-only run after you edit the model, replace `Ju
 
 ---
 
-**Sync commit:** `79a09a4a98401bc1612e4248c78ad6609b333d2c`
+**Sync commit:** `67d1ea9d1f607125bbea6a22e42447c0d2cd4abd`
