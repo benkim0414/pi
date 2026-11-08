@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { runGate } from "../src/gates.js";
+import * as config from "../src/config.js";
 import { Processes } from "../src/processes.js";
 
 vi.mock("../src/gates.js", () => ({ runGate: vi.fn() }));
@@ -691,3 +692,259 @@ it("uses the current process registry after session shutdown", async () => {
 		await scenario.events.get("session_shutdown")!({}, scenario.ctx);
 	}
 });
+
+it("keeps newer draft cancellation owned after an older draft settles", async () => {
+	const scenario = fixture();
+	let finishOld!: (value: any) => void;
+	let finishNew!: (value: any) => void;
+	const signals: AbortSignal[] = [];
+	scenario.ctx.modelRegistry.streamSimple = (
+		_model: any,
+		_input: any,
+		options: any,
+	) => {
+		signals.push(options.signal);
+		return {
+			result: () =>
+				new Promise((resolve) => {
+					if (signals.length === 1) finishOld = resolve;
+					else finishNew = resolve;
+				}),
+		};
+	};
+	const old = scenario.run("draft old");
+	const newer = scenario.run("draft newer");
+	finishOld({ content: [{ type: "text", text: "{}" }], stopReason: "stop" });
+	await old;
+	scenario.events.get("input")!({ source: "user" }, scenario.ctx);
+	const newerAborted = signals[1].aborted;
+	finishNew({ content: [{ type: "text", text: "{}" }], stopReason: "stop" });
+	await newer;
+	expect(newerAborted).toBe(true);
+	expect(scenario.pi.sendUserMessage).not.toHaveBeenCalled();
+});
+
+it("persists snapshots unaffected by later criteria changes", async () => {
+	const scenario = fixture();
+	await scenario.run("fix parser");
+	const initial = scenario.state();
+	await scenario.commands.get("subgoal")!(
+		"regression test passes",
+		scenario.ctx,
+	);
+	expect(initial.criteria).toEqual([]);
+	expect(scenario.state().criteria).toEqual(["regression test passes"]);
+});
+
+it("reserves one turn and continuation for overlapping evaluations", async () => {
+	const scenario = fixture();
+	await scenario.run("fix");
+	let release!: (value: any) => void;
+	scenario.complete.mockImplementationOnce(
+		() =>
+			new Promise((resolve) => {
+				release = resolve;
+			}),
+	);
+	const first = scenario.evaluate();
+	await vi.waitFor(() => expect(scenario.complete).toHaveBeenCalledTimes(1));
+	const duplicate = await scenario.evaluate();
+	release({
+		stopReason: "stop",
+		content: [{ type: "text", text: '{"verdict":"continue","reason":"more"}' }],
+	});
+	const result = await first;
+	expect(duplicate).toBeUndefined();
+	expect(result?.continue).toBe(true);
+	expect(scenario.state().used).toBe(1);
+	expect(scenario.complete).toHaveBeenCalledTimes(1);
+});
+
+it("discards session loading completed after tree navigation", async () => {
+	const scenario = fixture();
+	await scenario.run("fix");
+	let release!: (value: any) => void;
+	const loading = vi.spyOn(config, "loadConfig").mockImplementationOnce(
+		() =>
+			new Promise((resolve) => {
+				release = resolve;
+			}),
+	);
+	try {
+		const starting = scenario.events.get("session_start")!(
+			{ reason: "resume" },
+			scenario.ctx,
+		);
+		scenario.events.get("session_tree")!({}, scenario.ctx);
+		const saved = scenario.entries.length;
+		release({ maxTurns: 20 });
+		await starting;
+		expect(scenario.entries).toHaveLength(saved);
+		expect(scenario.state().status).toBe("paused");
+		expect(scenario.pi.sendUserMessage).toHaveBeenCalledTimes(1);
+	} finally {
+		loading.mockRestore();
+	}
+});
+
+it("keeps the newer session attached when older shutdown finishes", async () => {
+	const scenario = fixture();
+	let release!: () => void;
+	const closing = vi.spyOn(Processes.prototype, "close").mockImplementationOnce(
+		() =>
+			new Promise<void>((resolve) => {
+				release = resolve;
+			}),
+	);
+	try {
+		const shutdown = scenario.events.get("session_shutdown")!({}, scenario.ctx);
+		await scenario.events.get("session_start")!(
+			{ reason: "new" },
+			scenario.ctx,
+		);
+		await scenario.run("fix");
+		const oldStatusCalls = scenario.ctx.ui.setStatus.mock.calls.length;
+		release();
+		await shutdown;
+		expect(scenario.ctx.ui.setStatus).toHaveBeenCalledTimes(oldStatusCalls);
+		await scenario.run("pause");
+		expect(scenario.ctx.ui.setStatus).toHaveBeenLastCalledWith(
+			"goal",
+			expect.stringContaining("paused"),
+		);
+	} finally {
+		closing.mockRestore();
+	}
+});
+
+it("ignores submission failure after human input supersedes it", async () => {
+	const scenario = fixture();
+	let reject!: (reason: Error) => void;
+	scenario.pi.sendUserMessage.mockImplementationOnce(
+		() =>
+			new Promise((_resolve, fail) => {
+				reject = fail;
+			}),
+	);
+	const starting = scenario.run("fix");
+	scenario.events.get("input")!({ source: "user" }, scenario.ctx);
+	reject(new Error("late failure"));
+	await starting;
+	expect(scenario.state().status).toBe("active");
+});
+
+it("restores session state and config despite intervening human input", async () => {
+	const scenario = fixture();
+	await scenario.run("fix");
+	let release!: (value: config.Config) => void;
+	const loading = vi.spyOn(config, "loadConfig").mockImplementationOnce(
+		() =>
+			new Promise((resolve) => {
+				release = resolve;
+			}),
+	);
+	try {
+		const starting = scenario.events.get("session_start")!(
+			{ reason: "resume" },
+			scenario.ctx,
+		);
+		scenario.events.get("input")!({ source: "interactive" }, scenario.ctx);
+		release({ maxTurns: 7 });
+		await starting;
+		await scenario.run("status");
+		expect(scenario.ctx.ui.notify).toHaveBeenLastCalledWith(
+			expect.stringContaining('"objective": "fix"'),
+			"info",
+		);
+		await scenario.run("replacement");
+		expect(scenario.state().limit).toBe(7);
+	} finally {
+		loading.mockRestore();
+	}
+});
+
+it.each(["success", "failure"] as const)(
+	"settles a wake %s after human input without losing wake ownership",
+	async (outcome) => {
+		vi.useFakeTimers();
+		const scenario = fixture([
+			{ verdict: "wait", reason: "cooldown", wait_for_seconds: 1 },
+		]);
+		try {
+			await scenario.run("fix");
+			await scenario.evaluate();
+			let resolve!: () => void;
+			let reject!: (error: Error) => void;
+			scenario.pi.sendUserMessage.mockImplementationOnce(
+				() =>
+					new Promise<void>((done, fail) => {
+						resolve = done;
+						reject = fail;
+					}),
+			);
+			await vi.advanceTimersByTimeAsync(1000);
+			scenario.events.get("input")!({ source: "interactive" }, scenario.ctx);
+			scenario.ctx.isIdle = () => false;
+			if (outcome === "success") resolve();
+			else reject(new Error("send failed"));
+			await vi.advanceTimersByTimeAsync(0);
+			if (outcome === "success")
+				scenario.events.get("agent_settled")!({ aborted: false }, scenario.ctx);
+			await vi.advanceTimersByTimeAsync(1000);
+			expect(scenario.pi.sendUserMessage).toHaveBeenCalledTimes(2);
+			scenario.ctx.isIdle = () => true;
+			await vi.advanceTimersByTimeAsync(2000);
+			expect(scenario.pi.sendUserMessage).toHaveBeenCalledTimes(
+				outcome === "success" ? 2 : 3,
+			);
+			expect(scenario.state().status).toBe("active");
+		} finally {
+			await scenario.events.get("session_shutdown")!({}, scenario.ctx);
+			vi.useRealTimers();
+		}
+	},
+);
+
+it.each(["judge", "gate"] as const)(
+	"evaluates a new human turn while an obsolete %s is still pending",
+	async (kind) => {
+		const scenario = fixture([{ verdict: "continue", reason: "newer work" }]);
+		await scenario.run("fix");
+		let finishOld!: () => void;
+		let started = false;
+		if (kind === "judge") {
+			scenario.complete.mockImplementationOnce(
+				() =>
+					new Promise((resolve) => {
+						started = true;
+						finishOld = () =>
+							resolve({
+								stopReason: "stop",
+								content: [
+									{ type: "text", text: '{"verdict":"done","reason":"stale"}' },
+								],
+							});
+					}),
+			);
+		} else {
+			await scenario.run("gate add npm test");
+			vi.mocked(runGate).mockImplementationOnce(
+				() =>
+					new Promise((_resolve, reject) => {
+						started = true;
+						finishOld = () => reject(new Error("stale spawn failure"));
+					}),
+			);
+		}
+		const old = scenario.evaluate();
+		await vi.waitFor(() => expect(started).toBe(true));
+		scenario.events.get("input")!({ source: "interactive" }, scenario.ctx);
+		const newer = await scenario.evaluate();
+		finishOld();
+		await old;
+		expect(newer?.continue).toBe(true);
+		expect(scenario.state().used).toBe(2);
+		expect(scenario.state().status).toBe("active");
+		expect(scenario.state().reason).toBe("newer work");
+	},
+);

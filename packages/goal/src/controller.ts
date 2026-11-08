@@ -39,6 +39,7 @@ export class GoalController {
 	private human = 0;
 	private wakePending = false;
 	private pending: AbortController | undefined;
+	private evaluating: AbortController | undefined;
 	private unsubscribeInput: (() => void) | undefined;
 	private timer: ReturnType<typeof setTimeout> | undefined;
 	private processes = new Processes(() => this.scheduleWake());
@@ -51,10 +52,11 @@ export class GoalController {
 		this.unsubscribeInput?.();
 		this.unsubscribeInput = undefined;
 		this.invalidate();
-		await this.processes.close();
+		const previous = this.processes;
 		this.processes = new Processes(() => this.scheduleWake());
 		this.context?.ui.setStatus("goal", undefined);
 		this.context = undefined;
+		await previous.close();
 	}
 
 	snapshot(): Goal | undefined {
@@ -108,9 +110,16 @@ export class GoalController {
 			}
 			return undefined;
 		});
-		this.config = await loadConfig(getAgentDir(), c.cwd, (text) =>
-			this.notify(text),
+		// Input supersedes evaluation, but only lifecycle changes supersede restore.
+		const epoch = this.epoch;
+		const current = () => this.epoch === epoch;
+		const config = await loadConfig(
+			getAgentDir(),
+			c.cwd,
+			(text) => current() && this.notify(text),
 		);
+		if (!current()) return;
+		this.config = config;
 		this.goal = this.restore(c);
 		if (this.goal && reason === "fork" && this.goal.status === "active")
 			pause(this.goal, "Forked goal; use /goal resume.");
@@ -154,7 +163,7 @@ export class GoalController {
 	): Promise<BoundaryResult | undefined> {
 		this.context = context;
 		if (this.cannotEvaluate(event, context)) return;
-		if (!this.goal) return;
+		if (!this.goal || this.evaluating) return;
 		const goal = this.goal;
 		const checkpoint = this.evaluationCheckpoint(goal, context);
 		if (goal.used >= goal.limit) {
@@ -166,6 +175,7 @@ export class GoalController {
 		this.save();
 		const abort = new AbortController();
 		this.pending = abort;
+		this.evaluating = abort;
 
 		const onAbort = () => abort.abort();
 
@@ -179,16 +189,16 @@ export class GoalController {
 				checkpoint,
 			);
 		} catch (error) {
-			if (checkpoint.ownsGoal()) {
+			if (checkpoint.isCurrent()) {
 				pause(goal, `Goal evaluation failed: ${String(error)}`);
 				this.save();
 			}
 		} finally {
 			context.signal?.removeEventListener("abort", onAbort);
 			if (this.pending === abort) this.pending = undefined;
+			if (this.evaluating === abort) this.evaluating = undefined;
 		}
 	}
-
 	async process(
 		action: string,
 		args: { command?: string; id?: string; text?: string; patterns?: string[] },
@@ -275,6 +285,8 @@ export class GoalController {
 	private onHumanInput(): void {
 		this.human++;
 		this.pending?.abort();
+		// The old promise may ignore abort; it must not hold the next turn's slot.
+		this.evaluating = undefined;
 	}
 
 	private save(): void {
@@ -292,19 +304,27 @@ export class GoalController {
 		this.wakePending = false;
 		this.pending?.abort();
 		this.pending = undefined;
+		this.evaluating = undefined;
 		if (this.timer) clearTimeout(this.timer);
 		this.timer = undefined;
 	}
 
 	private async submit(goal: Goal): Promise<void> {
-		const ticket = this.epoch;
+		const epoch = this.epoch;
+		const current = this.captureInput();
 		try {
 			await this.pi.sendUserMessage(continuation(goal), {
 				expandPromptTemplates: false,
 			});
-			if (this.goal === goal && this.epoch === ticket) this.wakePending = false;
+			// An accepted send consumes its wake even if human input arrived meanwhile.
+			if (this.goal === goal && this.epoch === epoch) this.wakePending = false;
 		} catch (error) {
-			if (this.goal === goal && this.epoch === ticket) {
+			if (this.goal === goal && this.epoch === epoch) {
+				if (!current()) {
+					// Retry an unsent wake once the newer human turn permits it.
+					if (this.wakePending) this.scheduleWake();
+					return;
+				}
 				this.wakePending = false;
 				pause(goal, `Submission failed: ${String(error)}`);
 				this.save();

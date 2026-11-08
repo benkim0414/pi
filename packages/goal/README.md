@@ -87,3 +87,9 @@ extension tests retaining coverage of Pi event sequences and asynchronous races.
 Auxiliary model requests, gate execution, and process ownership retain their
 existing seams. Domain parsing and transitions remain independent of Pi and I/O.
 The persisted goal remains a plain versioned object.
+
+Async completion and cleanup retain ownership checks. Only one current evaluation
+owns a turn; new human input releases that ownership while obsolete requests wind
+down. Session restoration checks lifecycle ownership independently of human input.
+Accepted continuations consume their pending wake, and failed wakes superseded by
+human input retry once the session permits it.
