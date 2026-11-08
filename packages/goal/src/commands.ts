@@ -8,10 +8,22 @@ export function registerGoalCommands(
 ): void {
 	pi.registerCommand("goal", {
 		description: "Maintain an objective across turns",
-		handler: (args, context) => controller.command(parseCommand(args), context),
+		handler: async (args, context) => {
+			try {
+				await controller.execute(parseCommand(args), context);
+			} catch (error) {
+				context.ui.notify(String(error), "info");
+			}
+		},
 	});
 	pi.registerCommand("subgoal", {
 		description: "Manage additional goal acceptance criteria",
-		handler: async (args, context) => controller.criteria(args, context),
+		handler: async (args, context) => {
+			try {
+				controller.subgoal(args, context);
+			} catch (error) {
+				context.ui.notify(String(error), "info");
+			}
+		},
 	});
 }

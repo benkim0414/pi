@@ -23,7 +23,9 @@ iterations do not count. `/goal resume` grants a fresh budget.
   five-minute timeout and three failed attempts before pausing. Resume resets
   attempts. Contract verification text is never executed automatically.
 - `/goal wait <pid> [reason]` and `/goal unwait`: park on a local PID or release
-  waiting. The judge can also request process-session or timed waits.
+  waiting. The judge can also request process-session or timed waits. If none of
+  the supplied targets or cooldowns is usable, the goal pauses with a reason;
+  `/goal resume` restarts it.
 
 Aliases: continue/unpause resume; stop/done clear; gate rm removes. Control words
 pause/resume/status/show/unwait accept trailing text with a diagnostic; use `--`
@@ -44,7 +46,10 @@ The auxiliary judge uses the current model by default. Configure `goal.json` in
 Pi's agent directory or trusted project `.pi` directory (project overrides):
 
 ```json
-{ "maxTurns": 20, "judge": { "provider": "provider-name", "model": "model-id" } }
+{
+	"maxTurns": 20,
+	"judge": { "provider": "provider-name", "model": "model-id" }
+}
 ```
 
 Judge calls use a 30-second timeout and 4096 output tokens. Temporary failures
@@ -70,12 +75,21 @@ responses and real local terminals without provider credentials.
 
 ## Code structure
 
-The entrypoint delegates Pi registration to `src/session.ts`. Commands and session
-callbacks translate host input into complete `GoalController` actions. The
-controller privately owns goal state, evaluation, cancellation, generation checks,
-wake scheduling, persistence, and process-registry replacement. Async completion
-and cleanup retain ownership checks; only one current evaluation owns a turn.
-New human input releases that ownership while obsolete requests wind down. The
-process tool uses the current registry through a getter. Domain parsing and
-transitions remain independent of Pi and I/O. The persisted goal remains a plain
-versioned object. Lifecycle tests exercise registered commands and session events.
+The entrypoint delegates Pi lifecycle registration to `src/session.ts`. Command,
+session, and process-tool adapters translate Pi input into intent. `GoalController`
+is the goal execution module: its interface owns transitions, drafting and
+evaluation lifetimes, cancellation, wake scheduling, persistence, and session
+resources. Goal state and coordination flags are private; inspection returns a
+snapshot. Criteria and gate edits share the same transition implementation.
+
+Tests cross the controller interface to verify observable transitions, with
+extension tests retaining coverage of Pi event sequences and asynchronous races.
+Auxiliary model requests, gate execution, and process ownership retain their
+existing seams. Domain parsing and transitions remain independent of Pi and I/O.
+The persisted goal remains a plain versioned object.
+
+Async completion and cleanup retain ownership checks. Only one current evaluation
+owns a turn; new human input releases that ownership while obsolete requests wind
+down. Session restoration checks lifecycle ownership independently of human input.
+Accepted continuations consume their pending wake, and failed wakes superseded by
+human input retry once the session permits it.

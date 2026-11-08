@@ -1,9 +1,9 @@
 import {
-	getAgentDir,
 	type AgentBeforeSettleEvent,
 	type BoundaryResult,
 	type ExtensionAPI,
 	type ExtensionContext,
+	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { requestAuxiliary } from "./auxiliary.js";
@@ -30,7 +30,7 @@ const JUDGE = `Evaluate the standing objective, completion contract and ALL addi
 
 export const GOAL_ENTRY = "goal-state";
 
-// Owns session resources and the generations that invalidate asynchronous work.
+// Owns goal transitions, asynchronous work, and session resources.
 export class GoalController {
 	private goal: Goal | undefined;
 	private context: ExtensionContext | undefined;
@@ -39,20 +39,207 @@ export class GoalController {
 	private human = 0;
 	private wakePending = false;
 	private pending: AbortController | undefined;
+	private evaluating: AbortController | undefined;
 	private unsubscribeInput: (() => void) | undefined;
 	private timer: ReturnType<typeof setTimeout> | undefined;
-	private registry = new Processes(() => this.scheduleWake());
-
-	private evaluating: AbortController | undefined;
-	get processes(): Processes {
-		return this.registry;
-	}
+	private processes = new Processes(() => this.scheduleWake());
 
 	constructor(
 		private readonly pi: Pick<ExtensionAPI, "appendEntry" | "sendUserMessage">,
 	) {}
 
-	eligible(context: ExtensionContext): boolean {
+	async dispose(): Promise<void> {
+		this.unsubscribeInput?.();
+		this.unsubscribeInput = undefined;
+		this.invalidate();
+		const previous = this.processes;
+		this.processes = new Processes(() => this.scheduleWake());
+		this.context?.ui.setStatus("goal", undefined);
+		this.context = undefined;
+		await previous.close();
+	}
+
+	snapshot(): Goal | undefined {
+		return this.goal ? structuredClone(this.goal) : undefined;
+	}
+
+	async execute(command: Command, context: ExtensionContext): Promise<void> {
+		this.context = context;
+		if (!this.eligible(context)) {
+			if (context.mode === "tui")
+				this.notify("Trust the project before running /goal.");
+			return;
+		}
+		if (command.ignored)
+			this.notify(
+				`Ignored trailing text: ${command.ignored}. Use /goal -- <text> for a literal objective.`,
+			);
+		await this.executeGoalCommand(context, command);
+	}
+
+	subgoal(args: string, context: ExtensionContext): void {
+		this.context = context;
+		if (!this.eligible(context)) return;
+		const goal = this.requireGoal();
+		const text = args.trim();
+		if (!text) {
+			this.notify(JSON.stringify(goal.criteria));
+			return;
+		}
+		if (text === "clear") goal.criteria = [];
+		else if (text.startsWith("remove "))
+			goal.criteria.splice(
+				itemIndex(text.slice(7).trim(), goal.criteria.length),
+				1,
+			);
+		else goal.criteria.push(text);
+		this.commitEdit(goal, context);
+	}
+
+	async startSession(reason: string, c: ExtensionContext): Promise<void> {
+		this.context = c;
+		this.invalidate();
+		this.goal = undefined;
+		this.unsubscribeInput?.();
+		this.unsubscribeInput = undefined;
+		if (!this.eligible(c)) return;
+		this.unsubscribeInput = c.ui.onTerminalInput((data) => {
+			if (this.goal?.status === "active" && matchesKey(data, "escape")) {
+				const reason = this.abortActiveGoal();
+				if (reason !== undefined) this.notify(reason);
+			}
+			return undefined;
+		});
+		// Input supersedes evaluation, but only lifecycle changes supersede restore.
+		const epoch = this.epoch;
+		const current = () => this.epoch === epoch;
+		const config = await loadConfig(
+			getAgentDir(),
+			c.cwd,
+			(text) => current() && this.notify(text),
+		);
+		if (!current()) return;
+		this.config = config;
+		this.goal = this.restore(c);
+		if (this.goal && reason === "fork" && this.goal.status === "active")
+			pause(this.goal, "Forked goal; use /goal resume.");
+		if (this.goal?.wait?.kind === "process") {
+			this.goal.wait = undefined;
+			this.goal.reason =
+				"Previous process session ended; commands were not restarted.";
+		}
+		this.save();
+		if (this.goal?.status === "active") {
+			if (this.goal.wait) this.scheduleWake();
+			else await this.submit(this.goal);
+		}
+	}
+
+	navigateSession(c: ExtensionContext): void {
+		this.context = c;
+		this.invalidate();
+		this.goal = undefined;
+		if (!this.eligible(c)) return;
+		this.goal = this.restore(c);
+		if (this.goal?.status === "active")
+			pause(this.goal, "Tree navigation; use /goal resume.");
+		this.save();
+	}
+
+	input(source: string, context: ExtensionContext): void {
+		this.context = context;
+		if (source !== "extension") this.onHumanInput();
+	}
+
+	settled(aborted: boolean, c: ExtensionContext): void {
+		this.context = c;
+		if (aborted) this.abortActiveGoal();
+		if (this.goal?.wait || this.wakePending) this.scheduleWake();
+	}
+
+	async evaluate(
+		event: AgentBeforeSettleEvent,
+		context: ExtensionContext,
+	): Promise<BoundaryResult | undefined> {
+		this.context = context;
+		if (this.cannotEvaluate(event, context)) return;
+		if (!this.goal || this.evaluating) return;
+		const goal = this.goal;
+		const checkpoint = this.evaluationCheckpoint(goal, context);
+		if (goal.used >= goal.limit) {
+			pause(goal, "Turn budget exhausted. Use /goal resume or /goal clear.");
+			this.save();
+			return;
+		}
+		goal.used++;
+		this.save();
+		const abort = new AbortController();
+		this.pending = abort;
+		this.evaluating = abort;
+
+		const onAbort = () => abort.abort();
+
+		context.signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			return await this.evaluateCurrentGoal(
+				goal,
+				event,
+				context,
+				abort,
+				checkpoint,
+			);
+		} catch (error) {
+			if (checkpoint.isCurrent()) {
+				pause(goal, `Goal evaluation failed: ${String(error)}`);
+				this.save();
+			}
+		} finally {
+			context.signal?.removeEventListener("abort", onAbort);
+			if (this.pending === abort) this.pending = undefined;
+			if (this.evaluating === abort) this.evaluating = undefined;
+		}
+	}
+	async process(
+		action: string,
+		args: { command?: string; id?: string; text?: string; patterns?: string[] },
+		signal: AbortSignal | undefined,
+		context: ExtensionContext,
+	): Promise<unknown> {
+		if (!this.eligible(context))
+			throw new Error("Goal processes require a trusted TUI session.");
+		switch (action) {
+			case "start":
+				return this.processes.start(
+					args.command || "",
+					context.cwd,
+					args.patterns,
+					signal,
+				);
+			case "list":
+				return this.processes.list();
+			case "output":
+				return structuredClone(this.processes.get(args.id || ""));
+			case "input":
+				this.processes.input(args.id || "", args.text || "");
+				return "Input sent";
+			case "stop":
+				this.processes.stop(args.id || "");
+				return "Stop requested";
+			default:
+				throw new Error("Unknown process action");
+		}
+	}
+
+	private abortActiveGoal(): string | undefined {
+		const goal = this.goal;
+		if (goal?.status !== "active") return;
+		this.invalidate();
+		pause(goal, "Execution aborted; use /goal resume.");
+		this.save();
+		return goal.reason;
+	}
+
+	private eligible(context: ExtensionContext): boolean {
 		return context.mode === "tui" && context.isProjectTrusted();
 	}
 
@@ -100,17 +287,6 @@ export class GoalController {
 		this.pending?.abort();
 		// The old promise may ignore abort; it must not hold the next turn's slot.
 		this.evaluating = undefined;
-	}
-
-	async dispose(): Promise<void> {
-		this.unsubscribeInput?.();
-		this.unsubscribeInput = undefined;
-		this.invalidate();
-		const previous = this.registry;
-		this.registry = new Processes(() => this.scheduleWake());
-		this.context?.ui.setStatus("goal", undefined);
-		this.context = undefined;
-		await previous.close();
 	}
 
 	private save(): void {
@@ -169,7 +345,7 @@ export class GoalController {
 		let held = Date.now() < w.deadline;
 		if (w.kind === "pid") held = held && pidAlive(w.pid);
 		if (w.kind === "process") {
-			const p = this.registry.list().find((p) => p.id === w.id);
+			const p = this.processes.list().find((p) => p.id === w.id);
 			held = held && !!p?.running && !p.triggered;
 		}
 		if (!held) {
@@ -208,7 +384,11 @@ export class GoalController {
 					this.scheduleWake();
 					return;
 				}
-				await this.submit(this.goal);
+				try {
+					await this.submit(this.goal);
+				} catch (error) {
+					this.notify(`Cannot resume: ${String(error)}`);
+				}
 			},
 			Math.min(
 				1000,
@@ -220,154 +400,14 @@ export class GoalController {
 		);
 	}
 
-	async command(command: Command, context: ExtensionContext): Promise<void> {
-		this.context = context;
-		if (!this.eligible(context)) {
-			if (context.mode === "tui")
-				this.notify("Trust the project before running /goal.");
-			return;
-		}
-		try {
-			if (command.ignored)
-				this.notify(
-					`Ignored trailing text: ${command.ignored}. Use /goal -- <text> for a literal objective.`,
-				);
-			await this.executeGoalCommand(context, command);
-		} catch (error) {
-			this.notify(String(error));
-		}
-	}
-	criteria(args: string, context: ExtensionContext): void {
-		this.context = context;
-		if (!this.eligible(context)) return;
-		try {
-			const goal = this.requireGoal();
-			const text = args.trim();
-			if (!text) {
-				this.notify(JSON.stringify(goal.criteria));
-				return;
-			}
-			if (text === "clear") goal.criteria = [];
-			else if (text.startsWith("remove "))
-				goal.criteria.splice(
-					itemIndex(text.slice(7).trim(), goal.criteria.length),
-					1,
-				);
-			else goal.criteria.push(text);
-			this.invalidate();
-			goal.revision++;
-			this.wakePending = goal.status === "active" && !context.isIdle();
-			this.save();
-			this.scheduleWake();
-		} catch (error) {
-			this.notify(String(error));
-		}
-	}
-	async startSession(reason: string, c: ExtensionContext): Promise<void> {
-		this.context = c;
+	private commitEdit(goal: Goal, context: ExtensionContext): void {
 		this.invalidate();
-		this.goal = undefined;
-		this.unsubscribeInput?.();
-		this.unsubscribeInput = undefined;
-		if (!this.eligible(c)) return;
-		this.unsubscribeInput = c.ui.onTerminalInput((data) => {
-			if (this.goal?.status === "active" && matchesKey(data, "escape")) {
-				this.invalidate();
-				pause(this.goal, "Execution aborted; use /goal resume.");
-				this.save();
-				this.notify(this.goal.reason);
-			}
-			return undefined;
-		});
-		// Input supersedes evaluation, but only lifecycle changes supersede restore.
-		const epoch = this.epoch;
-		const current = () => this.epoch === epoch;
-		const config = await loadConfig(
-			getAgentDir(),
-			c.cwd,
-			(text) => current() && this.notify(text),
-		);
-		if (!current()) return;
-		this.config = config;
-		this.goal = this.restore(c);
-		if (this.goal && reason === "fork" && this.goal.status === "active")
-			pause(this.goal, "Forked goal; use /goal resume.");
-		if (this.goal?.wait?.kind === "process") {
-			this.goal.wait = undefined;
-			this.goal.reason =
-				"Previous process session ended; commands were not restarted.";
-		}
+		goal.revision++;
+		this.wakePending = goal.status === "active" && !context.isIdle();
 		this.save();
-		if (this.goal?.status === "active") {
-			if (this.goal.wait) this.scheduleWake();
-			else await this.submit(this.goal);
-		}
+		this.scheduleWake();
 	}
-	navigateSession(c: ExtensionContext): void {
-		this.context = c;
-		this.invalidate();
-		this.goal = undefined;
-		if (!this.eligible(c)) return;
-		this.goal = this.restore(c);
-		if (this.goal?.status === "active")
-			pause(this.goal, "Tree navigation; use /goal resume.");
-		this.save();
-	}
-	input(source: string, context: ExtensionContext): void {
-		this.context = context;
-		if (source !== "extension") this.onHumanInput();
-	}
-	settled(aborted: boolean, context: ExtensionContext): void {
-		this.context = context;
-		if (aborted && this.goal?.status === "active") {
-			this.invalidate();
-			pause(this.goal, "Execution aborted; use /goal resume.");
-			this.save();
-		}
-		if (this.goal?.wait || this.wakePending) this.scheduleWake();
-	}
-	async evaluate(
-		event: AgentBeforeSettleEvent,
-		context: ExtensionContext,
-	): Promise<BoundaryResult | undefined> {
-		this.context = context;
-		if (this.cannotEvaluate(event, context)) return;
-		if (!this.goal || this.evaluating) return;
-		const goal = this.goal;
-		const checkpoint = this.evaluationCheckpoint(goal, context);
-		if (goal.used >= goal.limit) {
-			pause(goal, "Turn budget exhausted. Use /goal resume or /goal clear.");
-			this.save();
-			return;
-		}
-		goal.used++;
-		this.save();
-		const abort = new AbortController();
-		this.pending = abort;
-		this.evaluating = abort;
 
-		const onAbort = () => abort.abort();
-
-		context.signal?.addEventListener("abort", onAbort, { once: true });
-		try {
-			return await this.evaluateCurrentGoal(
-				goal,
-				event,
-				context,
-				abort,
-				checkpoint,
-			);
-		} catch (error) {
-			if (checkpoint.isCurrent()) {
-				pause(goal, `Goal evaluation failed: ${String(error)}`);
-				this.save();
-			}
-		} finally {
-			context.signal?.removeEventListener("abort", onAbort);
-			if (this.pending === abort) this.pending = undefined;
-			if (this.evaluating === abort) this.evaluating = undefined;
-		}
-	}
 	private async startGoal(
 		context: ExtensionContext,
 		argument: string,
@@ -482,11 +522,7 @@ export class GoalController {
 			throw new Error(
 				"Usage: /goal gate [list|add <command>|remove <N>|clear]",
 			);
-		this.invalidate();
-		goal.revision++;
-		this.wakePending = goal.status === "active" && !context.isIdle();
-		this.save();
-		this.scheduleWake();
+		this.commitEdit(goal, context);
 	}
 
 	private async controlGoal(
@@ -603,7 +639,7 @@ export class GoalController {
 					contract: goal.contract,
 					criteria: goal.criteria,
 					response: this.latestAssistantText(event),
-					processes: this.registry
+					processes: this.processes
 						.list()
 						.map((p) => ({ ...p, output: p.output.slice(-3000) })),
 				}),
@@ -640,31 +676,41 @@ export class GoalController {
 		return result;
 	}
 
-	private assignWait(goal: Goal, result: Verdict): void {
+	private resolveWait(result: Verdict): Goal["wait"] {
 		const deadline = Date.now() + 1800000;
 		if (
 			result.wait_on_session &&
-			this.registry
+			this.processes
 				.list()
 				.some(
 					(p) => p.id === result.wait_on_session && p.running && !p.triggered,
 				)
 		)
-			goal.wait = {
+			return {
 				kind: "process",
 				id: result.wait_on_session,
 				deadline,
 				reason: result.reason,
 			};
-		else if (result.wait_on_pid && pidAlive(result.wait_on_pid))
-			goal.wait = {
+		if (
+			result.wait_on_pid &&
+			Number.isSafeInteger(result.wait_on_pid) &&
+			result.wait_on_pid > 0 &&
+			pidAlive(result.wait_on_pid)
+		)
+			return {
 				kind: "pid",
 				pid: result.wait_on_pid,
 				deadline,
 				reason: result.reason,
 			};
-		else if (result.wait_for_seconds)
-			goal.wait = {
+		if (
+			result.wait_for_seconds &&
+			Number.isSafeInteger(result.wait_for_seconds) &&
+			result.wait_for_seconds > 0 &&
+			result.wait_for_seconds <= 2147483
+		)
+			return {
 				kind: "time",
 				deadline: Date.now() + result.wait_for_seconds * 1000,
 				reason: result.reason,
@@ -694,8 +740,14 @@ export class GoalController {
 		event: AgentBeforeSettleEvent,
 	): BoundaryResult | undefined {
 		applyVerdict(goal, result);
-		if (result.verdict === "wait" && goal.status === "active")
-			this.assignWait(goal, result);
+		if (result.verdict === "wait" && goal.status === "active") {
+			goal.wait = this.resolveWait(result);
+			if (!goal.wait)
+				pause(
+					goal,
+					`Cannot wait: no live target or cooldown is available. ${result.reason} Use /goal resume to continue.`,
+				);
+		}
 		this.save();
 		this.notify(`Goal ${goal.status}: ${goal.reason}`);
 		if (goal.wait) {

@@ -236,7 +236,7 @@ describe("goal integration", () => {
 		expect(scenario.complete).not.toHaveBeenCalled();
 	});
 
-	it("pauses on escape", async () => {
+	it("pauses when the agent settles after an abort", async () => {
 		const scenario = fixture();
 
 		await scenario.run("fix");
@@ -246,6 +246,31 @@ describe("goal integration", () => {
 		);
 
 		expect(scenario.state().status).toBe("paused");
+	});
+
+	it("pauses once on terminal escape and reports the reason", async () => {
+		const scenario = fixture();
+		await scenario.events.get("session_start")!(
+			{ reason: "startup" },
+			scenario.ctx,
+		);
+		await scenario.run("fix");
+		const input = scenario.ctx.ui.onTerminalInput.mock.calls[0][0];
+		const entries = scenario.entries.length;
+
+		input("\u001b");
+		await scenario.events.get("agent_settled")!(
+			{ aborted: true },
+			scenario.ctx,
+		);
+
+		expect(scenario.state().status).toBe("paused");
+		expect(scenario.entries).toHaveLength(entries + 1);
+		expect(scenario.ctx.ui.notify).toHaveBeenLastCalledWith(
+			"Execution aborted; use /goal resume.",
+			"info",
+		);
+		await scenario.events.get("session_shutdown")!({}, scenario.ctx);
 	});
 
 	it("rejects replacement while busy but accepts pause", async () => {
