@@ -77,17 +77,22 @@ responses and real local terminals without provider credentials.
 
 The entrypoint delegates Pi lifecycle registration to `src/session.ts`. Command,
 session, and process-tool adapters translate Pi input into intent. `domain.ts`
-owns every persisted Goal field change as a named transition. `GoalController`
+owns every persisted Goal field change as a named transition, including turn
+budget consumption and drafted-contract overlays. Threshold gate and judge
+failures return an `EvaluationEffect` that says whether this call paused the
+Goal or left a continue reason. Subgoal, gate, and wait-pid phrasing parse in
+the domain so the controller receives finished edits. Wait-hold facts for
+admission and release share one builder on the controller. `GoalController`
 keeps drafting and evaluation lifetimes, cancellation, wake scheduling,
-persistence, and session resources. Goal state and coordination flags are
-private; inspection returns a snapshot. Criteria and gate edits share the same
-domain transition path.
+persistence, and session resources.
+Goal state and coordination flags are private; inspection returns a snapshot.
+Criteria and gate edits share the same domain transition path.
 
 Tests cross the controller interface for async races and persistence, and the
-domain interface for field transitions. Extension tests retain coverage of Pi
-event sequences. Auxiliary model requests, gate execution, and process ownership
-retain their existing seams. Domain transitions stay independent of Pi and I/O.
-The persisted goal remains a plain versioned object.
+domain interface for field transitions and evaluation effects. Extension tests
+retain coverage of Pi event sequences. Auxiliary model requests, gate execution,
+and process ownership retain their existing seams. Domain transitions stay
+independent of Pi and I/O. The persisted goal remains a plain versioned object.
 
 Async completion and cleanup retain ownership checks. Only one current evaluation
 owns a turn; new human input releases that ownership while obsolete requests wind
