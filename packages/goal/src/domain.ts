@@ -168,7 +168,10 @@ export function newGoal(text: string, limit = 20, revision = 1): Goal {
 	};
 }
 
-export function resume(goal: Goal): void {
+export const BUDGET_EXHAUSTED_REASON =
+	"Turn budget exhausted. Use /goal resume or /goal clear.";
+
+export function resume(goal: Goal): Goal {
 	goal.status = "active";
 	goal.used = 0;
 	goal.wait = undefined;
@@ -177,13 +180,207 @@ export function resume(goal: Goal): void {
 	for (const gate of goal.gates) gate.failures = 0;
 	goal.reason = "Goal resumed";
 	goal.revision++;
+	return goal;
 }
 
-export function pause(goal: Goal, reason: string): void {
+export function pause(goal: Goal, reason: string): Goal {
 	goal.status = "paused";
 	goal.wait = undefined;
 	goal.reason = reason;
 	goal.revision++;
+	return goal;
+}
+
+export function clear(goal: Goal): Goal {
+	goal.status = "cleared";
+	goal.wait = undefined;
+	goal.revision++;
+	return goal;
+}
+
+export function unwait(goal: Goal): Goal {
+	goal.wait = undefined;
+	goal.revision++;
+	return goal;
+}
+
+export function clearCriteria(goal: Goal): Goal {
+	goal.criteria = [];
+	goal.revision++;
+	return goal;
+}
+
+export function addCriterion(goal: Goal, text: string): Goal {
+	goal.criteria.push(text);
+	goal.revision++;
+	return goal;
+}
+
+export function removeCriterion(goal: Goal, index: number): Goal {
+	goal.criteria.splice(index, 1);
+	goal.revision++;
+	return goal;
+}
+
+export function addGate(goal: Goal, command: string): Goal {
+	goal.gates.push({ command, failures: 0 });
+	goal.revision++;
+	return goal;
+}
+
+export function removeGate(goal: Goal, index: number): Goal {
+	goal.gates.splice(index, 1);
+	goal.revision++;
+	return goal;
+}
+
+export function clearGates(goal: Goal): Goal {
+	goal.gates = [];
+	goal.revision++;
+	return goal;
+}
+
+export function applyGateResult(
+	goal: Goal,
+	gate: Gate,
+	output: { code: number; output: string; killed: boolean },
+): Goal {
+	gate.code = output.code;
+	gate.output = output.output;
+	if (output.code !== 0 || output.killed) {
+		gate.failures++;
+		goal.reason = `Gate failed (${gate.failures}/3): ${gate.command}\n${gate.output}`;
+		if (gate.failures >= 3) pause(goal, goal.reason);
+		return goal;
+	}
+	gate.failures = 0;
+	return goal;
+}
+
+export function recordTransportSuccess(goal: Goal): Goal {
+	goal.transportFailures = 0;
+	return goal;
+}
+
+export function recordTransportFailure(goal: Goal, error: string): Verdict {
+	goal.transportFailures++;
+	if (goal.transportFailures >= 5)
+		pause(goal, "Repeated judge transport failures. Check goal.json.");
+	return {
+		verdict: "continue",
+		reason: `Judge unavailable: ${error}`,
+	};
+}
+
+export function recordParseSuccess(goal: Goal): Goal {
+	goal.parseFailures = 0;
+	return goal;
+}
+
+export function recordParseFailure(goal: Goal): Verdict {
+	goal.parseFailures++;
+	if (goal.parseFailures >= 3)
+		pause(goal, "Repeated malformed judge replies. Check goal.json.");
+	return {
+		verdict: "continue",
+		reason: "Judge response could not be parsed.",
+	};
+}
+
+export function waitOnPid(
+	goal: Goal,
+	pid: number,
+	reason: string,
+	now: number,
+): Goal {
+	goal.wait = {
+		kind: "pid",
+		pid,
+		reason,
+		deadline: now + 1_800_000,
+	};
+	goal.revision++;
+	return goal;
+}
+
+export interface WaitHoldFacts {
+	now: number;
+	pidAlive: boolean;
+	processHeld: boolean;
+}
+
+export function releaseExpiredWait(goal: Goal, facts: WaitHoldFacts): Goal {
+	const wait = goal.wait;
+	if (!wait) return goal;
+	let held = facts.now < wait.deadline;
+	if (wait.kind === "pid") held = held && facts.pidAlive;
+	if (wait.kind === "process") held = held && facts.processHeld;
+	if (held) return goal;
+	goal.wait = undefined;
+	goal.revision++;
+	return goal;
+}
+
+export interface WaitAdmissionFacts {
+	now: number;
+	pidAlive: boolean;
+	processHeld: boolean;
+}
+
+export function admitWait(
+	goal: Goal,
+	result: Verdict,
+	facts: WaitAdmissionFacts,
+): Goal {
+	if (result.verdict !== "wait" || goal.status !== "active") return goal;
+	const ceiling = facts.now + 1_800_000;
+	if (result.wait_on_session && facts.processHeld) {
+		goal.wait = {
+			kind: "process",
+			id: result.wait_on_session,
+			deadline: ceiling,
+			reason: result.reason,
+		};
+		return goal;
+	}
+	if (
+		result.wait_on_pid &&
+		Number.isSafeInteger(result.wait_on_pid) &&
+		result.wait_on_pid > 0 &&
+		facts.pidAlive
+	) {
+		goal.wait = {
+			kind: "pid",
+			pid: result.wait_on_pid,
+			deadline: ceiling,
+			reason: result.reason,
+		};
+		return goal;
+	}
+	if (
+		result.wait_for_seconds &&
+		Number.isSafeInteger(result.wait_for_seconds) &&
+		result.wait_for_seconds > 0 &&
+		result.wait_for_seconds <= 2147483
+	) {
+		goal.wait = {
+			kind: "time",
+			deadline: facts.now + result.wait_for_seconds * 1000,
+			reason: result.reason,
+		};
+		return goal;
+	}
+	return pause(
+		goal,
+		`Cannot wait: no live target or cooldown is available. ${result.reason} Use /goal resume to continue.`,
+	);
+}
+
+export function clearRestoredProcessWait(goal: Goal): Goal {
+	if (goal.wait?.kind !== "process") return goal;
+	goal.wait = undefined;
+	goal.reason = "Previous process session ended; commands were not restarted.";
+	return goal;
 }
 
 export function itemIndex(text: string, length: number): number {
@@ -220,14 +417,14 @@ export function parseVerdict(text: string): Verdict {
 	return value as Verdict;
 }
 
-export function applyVerdict(goal: Goal, result: Verdict): void {
+export function applyVerdict(goal: Goal, result: Verdict): Goal {
 	goal.reason = result.reason;
 	if (result.verdict === "done") {
 		goal.status = "done";
 		goal.wait = undefined;
 	} else if (result.verdict === "blocked") pause(goal, result.reason);
-	else if (goal.used >= goal.limit)
-		pause(goal, "Turn budget exhausted. Use /goal resume or /goal clear.");
+	else if (goal.used >= goal.limit) pause(goal, BUDGET_EXHAUSTED_REASON);
+	return goal;
 }
 
 export function continuation(goal: Goal): string {
