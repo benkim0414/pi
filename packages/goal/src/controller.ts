@@ -12,22 +12,27 @@ import {
 	addCriterion,
 	addGate,
 	admitWait,
+	applyDraftContract,
 	applyGateResult,
 	applyVerdict,
-	BUDGET_EXHAUSTED_REASON,
 	type Command,
 	type CommandAction,
 	clear,
 	clearCriteria,
 	clearGates,
 	clearRestoredProcessWait,
+	consumeTurn,
 	continuation,
 	type Goal,
 	isGoal,
-	itemIndex,
+	type JudgeEffect,
 	newGoal,
+	type PipelineEffect,
 	parseDraftContract,
+	parseGate,
+	parseSubgoal,
 	parseVerdict,
+	parseWaitPid,
 	pause,
 	recordParseFailure,
 	recordParseSuccess,
@@ -39,6 +44,8 @@ import {
 	resume,
 	unwait,
 	type Verdict,
+	type WaitAdmissionFacts,
+	type WaitHoldFacts,
 	waitOnPid,
 } from "./domain.js";
 import { runGate } from "./gates.js";
@@ -99,18 +106,14 @@ export class GoalController {
 		this.context = context;
 		if (!this.eligible(context)) return;
 		const goal = this.requireGoal();
-		const text = args.trim();
-		if (!text) {
+		const edit = parseSubgoal(args, goal.criteria.length);
+		if (edit.action === "list") {
 			this.notify(JSON.stringify(goal.criteria));
 			return;
 		}
-		if (text === "clear") clearCriteria(goal);
-		else if (text.startsWith("remove "))
-			removeCriterion(
-				goal,
-				itemIndex(text.slice(7).trim(), goal.criteria.length),
-			);
-		else addCriterion(goal, text);
+		if (edit.action === "clear") clearCriteria(goal);
+		else if (edit.action === "remove") removeCriterion(goal, edit.index);
+		else addCriterion(goal, edit.text);
 		this.commitEdit(goal, context);
 	}
 
@@ -180,13 +183,9 @@ export class GoalController {
 		if (!this.goal || this.evaluating) return;
 		const goal = this.goal;
 		const checkpoint = this.evaluationCheckpoint(goal, context);
-		if (goal.used >= goal.limit) {
-			pause(goal, BUDGET_EXHAUSTED_REASON);
-			this.save();
-			return;
-		}
-		goal.used++;
+		const turn = consumeTurn(goal);
 		this.save();
+		if (turn.kind === "paused") return;
 		const abort = new AbortController();
 		this.pending = abort;
 		this.evaluating = abort;
@@ -353,20 +352,32 @@ export class GoalController {
 		return this.goal;
 	}
 
+	private waitHoldFacts(
+		options: { processId?: string; pid?: number; now?: number } = {},
+	): WaitHoldFacts & WaitAdmissionFacts {
+		const process = options.processId
+			? this.processes.list().find((entry) => entry.id === options.processId)
+			: undefined;
+		const pid = options.pid;
+		return {
+			now: options.now ?? Date.now(),
+			pidAlive: !!pid && Number.isSafeInteger(pid) && pid > 0 && pidAlive(pid),
+			processHeld: !!process?.running && !process.triggered,
+		};
+	}
+
 	private isWaiting(): boolean {
 		const goal = this.goal;
 		if (!goal?.wait) return false;
 		const wait = goal.wait;
 		const revision = goal.revision;
-		const process =
-			wait.kind === "process"
-				? this.processes.list().find((entry) => entry.id === wait.id)
-				: undefined;
-		releaseExpiredWait(goal, {
-			now: Date.now(),
-			pidAlive: wait.kind === "pid" ? pidAlive(wait.pid) : false,
-			processHeld: !!process?.running && !process.triggered,
-		});
+		releaseExpiredWait(
+			goal,
+			this.waitHoldFacts({
+				processId: wait.kind === "process" ? wait.id : undefined,
+				pid: wait.kind === "pid" ? wait.pid : undefined,
+			}),
+		);
 		if (goal.revision !== revision) this.save();
 		return !!goal.wait;
 	}
@@ -453,7 +464,7 @@ export class GoalController {
 					argument,
 					abort.signal,
 				);
-				Object.assign(next.contract, parseDraftContract(text));
+				applyDraftContract(next, parseDraftContract(text));
 			} catch {
 				draftFailed = true;
 			} finally {
@@ -496,17 +507,12 @@ export class GoalController {
 	}
 
 	private waitForPid(goal: Goal, argument: string): void {
-		const match = /^([1-9]\d*)(?:\s+(.*))?$/.exec(argument);
-		if (
-			!match ||
-			!Number.isSafeInteger(Number(match[1])) ||
-			!pidAlive(Number(match[1]))
-		)
-			throw new Error("Provide a live local PID.");
+		const { pid, reason } = parseWaitPid(argument);
+		if (!pidAlive(pid)) throw new Error("Provide a live local PID.");
 		if (goal.status !== "active")
 			throw new Error("Resume the goal before waiting.");
 		this.invalidate();
-		waitOnPid(goal, Number(match[1]), match[2] || "Process exit", Date.now());
+		waitOnPid(goal, pid, reason, Date.now());
 		this.save();
 		this.scheduleWake();
 	}
@@ -516,21 +522,14 @@ export class GoalController {
 		goal: Goal,
 		argument: string,
 	): void {
-		const [verb = "", ...parts] = argument.split(/\s+/);
-		const rest = parts.join(" ");
-		if (!verb || verb === "list") {
+		const edit = parseGate(argument, goal.gates.length);
+		if (edit.action === "list") {
 			this.notify(JSON.stringify(goal.gates, null, 2));
 			return;
 		}
-		if (verb === "add" && !rest) throw new Error("Provide a gate command.");
-		if (verb === "add") addGate(goal, rest);
-		else if (verb === "remove" || verb === "rm")
-			removeGate(goal, itemIndex(rest, goal.gates.length));
-		else if (verb === "clear" && !rest) clearGates(goal);
-		else
-			throw new Error(
-				"Usage: /goal gate [list|add <command>|remove <N>|clear]",
-			);
+		if (edit.action === "add") addGate(goal, edit.command);
+		else if (edit.action === "remove") removeGate(goal, edit.index);
+		else clearGates(goal);
 		this.commitEdit(goal, context);
 	}
 
@@ -605,16 +604,15 @@ export class GoalController {
 		context: ExtensionContext,
 		signal: AbortSignal,
 		valid: () => boolean,
-	): Promise<{ stale: boolean; verdict?: Verdict }> {
+	): Promise<{
+		stale: boolean;
+		effect?: PipelineEffect;
+	}> {
 		for (const gate of goal.gates) {
 			const output = await runGate(gate.command, context.cwd, signal);
 			if (!valid() || signal.aborted) return { stale: true };
-			applyGateResult(goal, gate, output);
-			if (output.code !== 0 || output.killed)
-				return {
-					stale: false,
-					verdict: { verdict: "continue", reason: goal.reason },
-				};
+			const effect = applyGateResult(goal, gate, output);
+			if (effect.kind !== "ok") return { stale: false, effect };
 		}
 		return { stale: false };
 	}
@@ -625,8 +623,8 @@ export class GoalController {
 		context: ExtensionContext,
 		abort: AbortController,
 		valid: () => boolean,
-	): Promise<Verdict | undefined> {
-		let result: Verdict | undefined;
+	): Promise<JudgeEffect | undefined> {
+		let effect: JudgeEffect | undefined;
 		const timeout = setTimeout(() => abort.abort(), 30000);
 		let raw = "";
 		try {
@@ -649,19 +647,19 @@ export class GoalController {
 			recordTransportSuccess(goal);
 		} catch (error) {
 			if (!valid()) return undefined;
-			result = recordTransportFailure(goal, String(error));
+			effect = recordTransportFailure(goal, String(error));
 		} finally {
 			clearTimeout(timeout);
 		}
-		if (!result) {
+		if (!effect) {
 			try {
-				result = parseVerdict(raw);
+				effect = { kind: "verdict", verdict: parseVerdict(raw) };
 				recordParseSuccess(goal);
 			} catch {
-				result = recordParseFailure(goal);
+				effect = recordParseFailure(goal);
 			}
 		}
-		return result;
+		return effect;
 	}
 
 	private latestAssistantText(event: AgentBeforeSettleEvent): string {
@@ -688,20 +686,14 @@ export class GoalController {
 	): BoundaryResult | undefined {
 		applyVerdict(goal, result);
 		if (result.verdict === "wait" && goal.status === "active") {
-			const session = result.wait_on_session
-				? this.processes
-						.list()
-						.find((entry) => entry.id === result.wait_on_session)
-				: undefined;
-			admitWait(goal, result, {
-				now: Date.now(),
-				processHeld: !!session?.running && !session.triggered,
-				pidAlive:
-					!!result.wait_on_pid &&
-					Number.isSafeInteger(result.wait_on_pid) &&
-					result.wait_on_pid > 0 &&
-					pidAlive(result.wait_on_pid),
-			});
+			admitWait(
+				goal,
+				result,
+				this.waitHoldFacts({
+					processId: result.wait_on_session,
+					pid: result.wait_on_pid,
+				}),
+			);
 		}
 		this.save();
 		this.notify(`Goal ${goal.status}: ${goal.reason}`);
@@ -739,6 +731,46 @@ export class GoalController {
 		);
 	}
 
+	private noteOwnedPause(
+		checkpoint: ReturnType<GoalController["evaluationCheckpoint"]>,
+		reason: string,
+	): void {
+		if (!checkpoint.ownsGoal()) return;
+		this.save();
+		this.notify(reason);
+	}
+
+	private saveOwnedIfPaused(
+		goal: Goal,
+		checkpoint: ReturnType<GoalController["evaluationCheckpoint"]>,
+	): void {
+		if (!checkpoint.ownsGoal()) return;
+		this.save();
+		if (goal.status === "paused") this.notify(goal.reason);
+	}
+
+	private commitEvaluationEffect(
+		goal: Goal,
+		event: AgentBeforeSettleEvent,
+		checkpoint: ReturnType<GoalController["evaluationCheckpoint"]>,
+		valid: () => boolean,
+		effect: JudgeEffect,
+	): BoundaryResult | undefined {
+		if (effect.kind === "paused") {
+			this.noteOwnedPause(checkpoint, effect.reason);
+			return;
+		}
+		if (!valid()) {
+			this.saveOwnedIfPaused(goal, checkpoint);
+			return;
+		}
+		const verdict =
+			effect.kind === "continue"
+				? { verdict: "continue" as const, reason: effect.reason }
+				: effect.verdict;
+		return this.commitVerdict(goal, verdict, event);
+	}
+
 	private async evaluateCurrentGoal(
 		goal: Goal,
 		event: AgentBeforeSettleEvent,
@@ -747,7 +779,6 @@ export class GoalController {
 		checkpoint: ReturnType<GoalController["evaluationCheckpoint"]>,
 	): Promise<BoundaryResult | undefined> {
 		const valid = checkpoint.isCurrent;
-		let result: Verdict | undefined;
 		const gateResult = await this.evaluateGates(
 			goal,
 			context,
@@ -755,18 +786,12 @@ export class GoalController {
 			valid,
 		);
 		if (gateResult.stale) return;
-		result = gateResult.verdict;
-		if (!result && !valid()) return;
-		if (!result)
-			result = await this.judgeGoal(goal, event, context, abort, valid);
-		if (!result) return;
-		if (!valid()) {
-			if (checkpoint.ownsGoal()) {
-				this.save();
-				if (goal.status === "paused") this.notify(goal.reason);
-			}
-			return;
+		let effect: JudgeEffect | undefined = gateResult.effect;
+		if (!effect) {
+			if (!valid()) return;
+			effect = await this.judgeGoal(goal, event, context, abort, valid);
 		}
-		return this.commitVerdict(goal, result, event);
+		if (!effect) return;
+		return this.commitEvaluationEffect(goal, event, checkpoint, valid, effect);
 	}
 }

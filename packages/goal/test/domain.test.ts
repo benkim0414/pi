@@ -1,17 +1,25 @@
 import { describe, expect, it } from "vitest";
 import {
 	admitWait,
+	applyDraftContract,
+	applyGateResult,
 	applyVerdict,
 	BUDGET_EXHAUSTED_REASON,
 	clear,
+	consumeTurn,
 	isGoal,
 	itemIndex,
 	newGoal,
 	parseCommand,
 	parseContract,
 	parseDraftContract,
+	parseGate,
+	parseSubgoal,
 	parseVerdict,
+	parseWaitPid,
 	pause,
+	recordParseFailure,
+	recordTransportFailure,
 	releaseExpiredWait,
 	resume,
 	unwait,
@@ -46,6 +54,36 @@ describe("goal contract", () => {
 		const length = 2;
 
 		expect(() => itemIndex(input, length)).toThrow();
+	});
+
+	it.each([
+		["", { action: "list" }],
+		["clear", { action: "clear" }],
+		["remove 1", { action: "remove", index: 0 }],
+		["ship it", { action: "add", text: "ship it" }],
+	] as const)("parses subgoal %j", (input, expected) => {
+		expect(parseSubgoal(input, 2)).toEqual(expected);
+	});
+
+	it.each([
+		["", { action: "list" }],
+		["list", { action: "list" }],
+		["add npm test", { action: "add", command: "npm test" }],
+		["rm 1", { action: "remove", index: 0 }],
+		["clear", { action: "clear" }],
+	] as const)("parses gate %j", (input, expected) => {
+		expect(parseGate(input, 2)).toEqual(expected);
+	});
+
+	it("parses a wait pid and reason", () => {
+		expect(parseWaitPid("1234 cooling")).toEqual({
+			pid: 1234,
+			reason: "cooling",
+		});
+	});
+
+	it("rejects a non-positive wait pid", () => {
+		expect(() => parseWaitPid("0")).toThrow(/live local PID/);
 	});
 
 	it.each([
@@ -247,4 +285,88 @@ describe("draft contract parsing", () => {
 			expect(() => parseDraftContract(text)).toThrow();
 		},
 	);
+
+	it("overlays a drafted contract onto a new Goal", () => {
+		const goal = newGoal("fix the parser");
+
+		applyDraftContract(goal, {
+			verification: "tests pass",
+			constraints: "API",
+		});
+
+		expect(goal.contract).toEqual({
+			verification: "tests pass",
+			constraints: "API",
+		});
+	});
+});
+
+describe("evaluation effects", () => {
+	it("consumes a turn or pauses when the budget is already spent", () => {
+		const active = newGoal("fix", 2);
+		expect(consumeTurn(active)).toEqual({ kind: "ok" });
+		expect(active.used).toBe(1);
+
+		const spent = newGoal("fix", 1);
+		spent.used = 1;
+		expect(consumeTurn(spent)).toEqual({
+			kind: "paused",
+			reason: BUDGET_EXHAUSTED_REASON,
+		});
+		expect(spent.status).toBe("paused");
+		expect(spent.used).toBe(1);
+	});
+
+	it("reports a gate pause instead of a continue verdict", () => {
+		const goal = newGoal("fix");
+		const gate = { command: "false", failures: 2 };
+
+		const effect = applyGateResult(goal, gate, {
+			code: 1,
+			output: "boom",
+			killed: false,
+		});
+
+		expect(effect).toEqual({ kind: "paused", reason: goal.reason });
+		expect(goal.status).toBe("paused");
+		expect(gate.failures).toBe(3);
+	});
+
+	it("reports a continue effect for a gate failure under the threshold", () => {
+		const goal = newGoal("fix");
+		const gate = { command: "false", failures: 0 };
+
+		const effect = applyGateResult(goal, gate, {
+			code: 1,
+			output: "boom",
+			killed: false,
+		});
+
+		expect(effect.kind).toBe("continue");
+		expect(goal.status).toBe("active");
+		expect(gate.failures).toBe(1);
+	});
+
+	it("pauses after three malformed judge replies without a continue verdict", () => {
+		const goal = newGoal("fix");
+		goal.parseFailures = 2;
+
+		const effect = recordParseFailure(goal);
+
+		expect(effect).toEqual({ kind: "paused", reason: goal.reason });
+		expect(goal.status).toBe("paused");
+		expect(goal.reason).toContain("malformed judge");
+	});
+
+	it("returns continue for transport failures under the threshold", () => {
+		const goal = newGoal("fix");
+
+		const effect = recordTransportFailure(goal, "timeout");
+
+		expect(effect).toEqual({
+			kind: "continue",
+			reason: "Judge unavailable: timeout",
+		});
+		expect(goal.status).toBe("active");
+	});
 });

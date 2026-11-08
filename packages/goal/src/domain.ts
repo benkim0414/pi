@@ -151,6 +151,55 @@ export function parseCommand(text: string): Command {
 	return { action: "set", argument: raw };
 }
 
+export type SubgoalEdit =
+	| { action: "list" }
+	| { action: "clear" }
+	| { action: "remove"; index: number }
+	| { action: "add"; text: string };
+
+export function parseSubgoal(args: string, criteriaCount: number): SubgoalEdit {
+	const text = args.trim();
+	if (!text) return { action: "list" };
+	if (text === "clear") return { action: "clear" };
+	if (text.startsWith("remove "))
+		return {
+			action: "remove",
+			index: itemIndex(text.slice(7).trim(), criteriaCount),
+		};
+	return { action: "add", text };
+}
+
+export type GateEdit =
+	| { action: "list" }
+	| { action: "add"; command: string }
+	| { action: "remove"; index: number }
+	| { action: "clear" };
+
+export function parseGate(argument: string, gateCount: number): GateEdit {
+	const [verb = "", ...parts] = argument.trim().split(/\s+/);
+	const rest = parts.join(" ");
+	if (!verb || verb === "list") return { action: "list" };
+	if (verb === "add") {
+		if (!rest) throw new Error("Provide a gate command.");
+		return { action: "add", command: rest };
+	}
+	if (verb === "remove" || verb === "rm")
+		return { action: "remove", index: itemIndex(rest, gateCount) };
+	if (verb === "clear" && !rest) return { action: "clear" };
+	throw new Error("Usage: /goal gate [list|add <command>|remove <N>|clear]");
+}
+
+export function parseWaitPid(argument: string): {
+	pid: number;
+	reason: string;
+} {
+	const match = /^([1-9]\d*)(?:\s+(.*))?$/.exec(argument.trim());
+	const pid = match ? Number(match[1]) : Number.NaN;
+	if (!match || !Number.isSafeInteger(pid))
+		throw new Error("Provide a live local PID.");
+	return { pid, reason: match[2] || "Process exit" };
+}
+
 export function newGoal(text: string, limit = 20, revision = 1): Goal {
 	if (!text.trim()) throw new Error("Goal text is empty.");
 	return {
@@ -240,21 +289,38 @@ export function clearGates(goal: Goal): Goal {
 	return goal;
 }
 
+/** Result of a domain step that may pause the Goal or ask the controller to continue. */
+export type EvaluationEffect =
+	| { kind: "ok" }
+	| { kind: "continue"; reason: string }
+	| { kind: "paused"; reason: string };
+
+/** Gate or judge step that stops the pipeline without a successful judge verdict. */
+export type PipelineEffect = Exclude<EvaluationEffect, { kind: "ok" }>;
+
+/** Judge step that either pauses, continues under threshold, or yields a verdict. */
+export type JudgeEffect =
+	| PipelineEffect
+	| { kind: "verdict"; verdict: Verdict };
+
 export function applyGateResult(
 	goal: Goal,
 	gate: Gate,
 	output: { code: number; output: string; killed: boolean },
-): Goal {
+): EvaluationEffect {
 	gate.code = output.code;
 	gate.output = output.output;
 	if (output.code !== 0 || output.killed) {
 		gate.failures++;
 		goal.reason = `Gate failed (${gate.failures}/3): ${gate.command}\n${gate.output}`;
-		if (gate.failures >= 3) pause(goal, goal.reason);
-		return goal;
+		if (gate.failures >= 3) {
+			pause(goal, goal.reason);
+			return { kind: "paused", reason: goal.reason };
+		}
+		return { kind: "continue", reason: goal.reason };
 	}
 	gate.failures = 0;
-	return goal;
+	return { kind: "ok" };
 }
 
 export function recordTransportSuccess(goal: Goal): Goal {
@@ -262,12 +328,17 @@ export function recordTransportSuccess(goal: Goal): Goal {
 	return goal;
 }
 
-export function recordTransportFailure(goal: Goal, error: string): Verdict {
+export function recordTransportFailure(
+	goal: Goal,
+	error: string,
+): PipelineEffect {
 	goal.transportFailures++;
-	if (goal.transportFailures >= 5)
+	if (goal.transportFailures >= 5) {
 		pause(goal, "Repeated judge transport failures. Check goal.json.");
+		return { kind: "paused", reason: goal.reason };
+	}
 	return {
-		verdict: "continue",
+		kind: "continue",
 		reason: `Judge unavailable: ${error}`,
 	};
 }
@@ -277,14 +348,32 @@ export function recordParseSuccess(goal: Goal): Goal {
 	return goal;
 }
 
-export function recordParseFailure(goal: Goal): Verdict {
+export function recordParseFailure(goal: Goal): PipelineEffect {
 	goal.parseFailures++;
-	if (goal.parseFailures >= 3)
+	if (goal.parseFailures >= 3) {
 		pause(goal, "Repeated malformed judge replies. Check goal.json.");
+		return { kind: "paused", reason: goal.reason };
+	}
 	return {
-		verdict: "continue",
+		kind: "continue",
 		reason: "Judge response could not be parsed.",
 	};
+}
+
+/** Spend one evaluation turn, or pause when the budget is already exhausted. */
+export function consumeTurn(goal: Goal): EvaluationEffect {
+	if (goal.used >= goal.limit) {
+		pause(goal, BUDGET_EXHAUSTED_REASON);
+		return { kind: "paused", reason: goal.reason };
+	}
+	goal.used++;
+	return { kind: "ok" };
+}
+
+/** Overlay a drafted contract onto a Goal from newGoal. */
+export function applyDraftContract(goal: Goal, draft: Contract): Goal {
+	Object.assign(goal.contract, draft);
+	return goal;
 }
 
 export function waitOnPid(
