@@ -76,16 +76,17 @@ responses and real local terminals without provider credentials.
 ## Code structure
 
 The entrypoint delegates Pi lifecycle registration to `src/session.ts`. Command,
-session, and process-tool adapters translate Pi input into intent. `GoalController`
-is the goal execution module: its interface owns transitions, drafting and
-evaluation lifetimes, cancellation, wake scheduling, persistence, and session
-resources. Goal state and coordination flags are private; inspection returns a
-snapshot. Criteria and gate edits share the same transition implementation.
+session, and process-tool adapters translate Pi input into intent. `domain.ts`
+owns every persisted Goal field change as a named transition. `GoalController`
+keeps drafting and evaluation lifetimes, cancellation, wake scheduling,
+persistence, and session resources. Goal state and coordination flags are
+private; inspection returns a snapshot. Criteria and gate edits share the same
+domain transition path.
 
-Tests cross the controller interface to verify observable transitions, with
-extension tests retaining coverage of Pi event sequences and asynchronous races.
-Auxiliary model requests, gate execution, and process ownership retain their
-existing seams. Domain parsing and transitions remain independent of Pi and I/O.
+Tests cross the controller interface for async races and persistence, and the
+domain interface for field transitions. Extension tests retain coverage of Pi
+event sequences. Auxiliary model requests, gate execution, and process ownership
+retain their existing seams. Domain transitions stay independent of Pi and I/O.
 The persisted goal remains a plain versioned object.
 
 Async completion and cleanup retain ownership checks. Only one current evaluation

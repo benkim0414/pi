@@ -9,9 +9,18 @@ import { matchesKey } from "@earendil-works/pi-tui";
 import { requestAuxiliary } from "./auxiliary.js";
 import { type Config, loadConfig } from "./config.js";
 import {
+	addCriterion,
+	addGate,
+	admitWait,
+	applyGateResult,
 	applyVerdict,
+	BUDGET_EXHAUSTED_REASON,
 	type Command,
 	type CommandAction,
+	clear,
+	clearCriteria,
+	clearGates,
+	clearRestoredProcessWait,
 	continuation,
 	type Goal,
 	isGoal,
@@ -20,8 +29,17 @@ import {
 	parseDraftContract,
 	parseVerdict,
 	pause,
+	recordParseFailure,
+	recordParseSuccess,
+	recordTransportFailure,
+	recordTransportSuccess,
+	releaseExpiredWait,
+	removeCriterion,
+	removeGate,
 	resume,
+	unwait,
 	type Verdict,
+	waitOnPid,
 } from "./domain.js";
 import { runGate } from "./gates.js";
 import { Processes, pidAlive } from "./processes.js";
@@ -86,13 +104,13 @@ export class GoalController {
 			this.notify(JSON.stringify(goal.criteria));
 			return;
 		}
-		if (text === "clear") goal.criteria = [];
+		if (text === "clear") clearCriteria(goal);
 		else if (text.startsWith("remove "))
-			goal.criteria.splice(
+			removeCriterion(
+				goal,
 				itemIndex(text.slice(7).trim(), goal.criteria.length),
-				1,
 			);
-		else goal.criteria.push(text);
+		else addCriterion(goal, text);
 		this.commitEdit(goal, context);
 	}
 
@@ -123,11 +141,7 @@ export class GoalController {
 		this.goal = this.restore(c);
 		if (this.goal && reason === "fork" && this.goal.status === "active")
 			pause(this.goal, "Forked goal; use /goal resume.");
-		if (this.goal?.wait?.kind === "process") {
-			this.goal.wait = undefined;
-			this.goal.reason =
-				"Previous process session ended; commands were not restarted.";
-		}
+		if (this.goal) clearRestoredProcessWait(this.goal);
 		this.save();
 		if (this.goal?.status === "active") {
 			if (this.goal.wait) this.scheduleWake();
@@ -167,7 +181,7 @@ export class GoalController {
 		const goal = this.goal;
 		const checkpoint = this.evaluationCheckpoint(goal, context);
 		if (goal.used >= goal.limit) {
-			pause(goal, "Turn budget exhausted. Use /goal resume or /goal clear.");
+			pause(goal, BUDGET_EXHAUSTED_REASON);
 			this.save();
 			return;
 		}
@@ -340,19 +354,21 @@ export class GoalController {
 	}
 
 	private isWaiting(): boolean {
-		if (!this.goal?.wait) return false;
-		const w = this.goal.wait;
-		let held = Date.now() < w.deadline;
-		if (w.kind === "pid") held = held && pidAlive(w.pid);
-		if (w.kind === "process") {
-			const p = this.processes.list().find((p) => p.id === w.id);
-			held = held && !!p?.running && !p.triggered;
-		}
-		if (!held) {
-			this.goal.wait = undefined;
-			this.save();
-		}
-		return held;
+		const goal = this.goal;
+		if (!goal?.wait) return false;
+		const wait = goal.wait;
+		const revision = goal.revision;
+		const process =
+			wait.kind === "process"
+				? this.processes.list().find((entry) => entry.id === wait.id)
+				: undefined;
+		releaseExpiredWait(goal, {
+			now: Date.now(),
+			pidAlive: wait.kind === "pid" ? pidAlive(wait.pid) : false,
+			processHeld: !!process?.running && !process.triggered,
+		});
+		if (goal.revision !== revision) this.save();
+		return !!goal.wait;
 	}
 
 	private scheduleWake(): void {
@@ -402,7 +418,6 @@ export class GoalController {
 
 	private commitEdit(goal: Goal, context: ExtensionContext): void {
 		this.invalidate();
-		goal.revision++;
 		this.wakePending = goal.status === "active" && !context.isIdle();
 		this.save();
 		this.scheduleWake();
@@ -491,13 +506,7 @@ export class GoalController {
 		if (goal.status !== "active")
 			throw new Error("Resume the goal before waiting.");
 		this.invalidate();
-		goal.wait = {
-			kind: "pid",
-			pid: Number(match[1]),
-			reason: match[2] || "Process exit",
-			deadline: Date.now() + 1800000,
-		};
-		goal.revision++;
+		waitOnPid(goal, Number(match[1]), match[2] || "Process exit", Date.now());
 		this.save();
 		this.scheduleWake();
 	}
@@ -514,10 +523,10 @@ export class GoalController {
 			return;
 		}
 		if (verb === "add" && !rest) throw new Error("Provide a gate command.");
-		if (verb === "add") goal.gates.push({ command: rest, failures: 0 });
+		if (verb === "add") addGate(goal, rest);
 		else if (verb === "remove" || verb === "rm")
-			goal.gates.splice(itemIndex(rest, goal.gates.length), 1);
-		else if (verb === "clear" && !rest) goal.gates = [];
+			removeGate(goal, itemIndex(rest, goal.gates.length));
+		else if (verb === "clear" && !rest) clearGates(goal);
 		else
 			throw new Error(
 				"Usage: /goal gate [list|add <command>|remove <N>|clear]",
@@ -532,9 +541,7 @@ export class GoalController {
 		if (action === "clear") {
 			this.invalidate();
 			if (this.goal) {
-				this.goal.status = "cleared";
-				this.goal.wait = undefined;
-				this.goal.revision++;
+				clear(this.goal);
 				this.save();
 			}
 			this.notify("Goal cleared.");
@@ -557,8 +564,7 @@ export class GoalController {
 		}
 		if (action === "unwait") {
 			this.invalidate();
-			goal.wait = undefined;
-			goal.revision++;
+			unwait(goal);
 			this.save();
 			if (goal.status === "active" && context.isIdle()) await this.submit(goal);
 			return;
@@ -603,18 +609,12 @@ export class GoalController {
 		for (const gate of goal.gates) {
 			const output = await runGate(gate.command, context.cwd, signal);
 			if (!valid() || signal.aborted) return { stale: true };
-			gate.code = output.code;
-			gate.output = output.output;
-			if (output.code !== 0 || output.killed) {
-				gate.failures++;
-				goal.reason = `Gate failed (${gate.failures}/3): ${gate.command}\n${gate.output}`;
-				if (gate.failures >= 3) pause(goal, goal.reason);
+			applyGateResult(goal, gate, output);
+			if (output.code !== 0 || output.killed)
 				return {
 					stale: false,
 					verdict: { verdict: "continue", reason: goal.reason },
 				};
-			}
-			gate.failures = 0;
 		}
 		return { stale: false };
 	}
@@ -646,75 +646,22 @@ export class GoalController {
 				abort.signal,
 			);
 			if (!valid()) return undefined;
-			goal.transportFailures = 0;
+			recordTransportSuccess(goal);
 		} catch (error) {
 			if (!valid()) return undefined;
-			goal.transportFailures++;
-			if (goal.transportFailures >= 5)
-				pause(goal, "Repeated judge transport failures. Check goal.json.");
-			result = {
-				verdict: "continue",
-				reason: `Judge unavailable: ${String(error)}`,
-			};
+			result = recordTransportFailure(goal, String(error));
 		} finally {
 			clearTimeout(timeout);
 		}
 		if (!result) {
 			try {
 				result = parseVerdict(raw);
-				goal.parseFailures = 0;
+				recordParseSuccess(goal);
 			} catch {
-				goal.parseFailures++;
-				if (goal.parseFailures >= 3)
-					pause(goal, "Repeated malformed judge replies. Check goal.json.");
-				result = {
-					verdict: "continue",
-					reason: "Judge response could not be parsed.",
-				};
+				result = recordParseFailure(goal);
 			}
 		}
 		return result;
-	}
-
-	private resolveWait(result: Verdict): Goal["wait"] {
-		const deadline = Date.now() + 1800000;
-		if (
-			result.wait_on_session &&
-			this.processes
-				.list()
-				.some(
-					(p) => p.id === result.wait_on_session && p.running && !p.triggered,
-				)
-		)
-			return {
-				kind: "process",
-				id: result.wait_on_session,
-				deadline,
-				reason: result.reason,
-			};
-		if (
-			result.wait_on_pid &&
-			Number.isSafeInteger(result.wait_on_pid) &&
-			result.wait_on_pid > 0 &&
-			pidAlive(result.wait_on_pid)
-		)
-			return {
-				kind: "pid",
-				pid: result.wait_on_pid,
-				deadline,
-				reason: result.reason,
-			};
-		if (
-			result.wait_for_seconds &&
-			Number.isSafeInteger(result.wait_for_seconds) &&
-			result.wait_for_seconds > 0 &&
-			result.wait_for_seconds <= 2147483
-		)
-			return {
-				kind: "time",
-				deadline: Date.now() + result.wait_for_seconds * 1000,
-				reason: result.reason,
-			};
 	}
 
 	private latestAssistantText(event: AgentBeforeSettleEvent): string {
@@ -741,12 +688,20 @@ export class GoalController {
 	): BoundaryResult | undefined {
 		applyVerdict(goal, result);
 		if (result.verdict === "wait" && goal.status === "active") {
-			goal.wait = this.resolveWait(result);
-			if (!goal.wait)
-				pause(
-					goal,
-					`Cannot wait: no live target or cooldown is available. ${result.reason} Use /goal resume to continue.`,
-				);
+			const session = result.wait_on_session
+				? this.processes
+						.list()
+						.find((entry) => entry.id === result.wait_on_session)
+				: undefined;
+			admitWait(goal, result, {
+				now: Date.now(),
+				processHeld: !!session?.running && !session.triggered,
+				pidAlive:
+					!!result.wait_on_pid &&
+					Number.isSafeInteger(result.wait_on_pid) &&
+					result.wait_on_pid > 0 &&
+					pidAlive(result.wait_on_pid),
+			});
 		}
 		this.save();
 		this.notify(`Goal ${goal.status}: ${goal.reason}`);
