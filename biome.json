@@ -8,6 +8,7 @@
 			"!!**/dist",
 			"!!**/coverage",
 			"!!**/.cache",
+			"!!**/.agents",
 			"!package-lock.json"
 		]
 	},
