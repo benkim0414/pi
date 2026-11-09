@@ -19,7 +19,7 @@
 		"@earendil-works/pi-ai": "1.5.0",
 		"@earendil-works/pi-coding-agent": "1.5.0",
 		"@earendil-works/pi-tui": "1.5.0",
-		"typebox": "1.4.3"
+		"typebox": "1.4.4"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",
